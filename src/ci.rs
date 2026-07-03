@@ -25,6 +25,7 @@ struct CiArgs {
     output: Option<String>,
     /// Bytes per second. Fail if the rolling-window growth rate exceeds this.
     growth_rate: Option<u64>,
+    sample_interval: Option<u64>,
 }
 
 pub fn ci_main(args: &[String]) -> i32 {
@@ -54,7 +55,7 @@ pub fn ci_main(args: &[String]) -> i32 {
     };
 
     let start = Instant::now();
-    let poll_interval = Duration::from_millis(1000);
+    let poll_interval = Duration::from_millis(parsed.sample_interval.unwrap_or(1000));
     let mut sys = System::new_all();
     let mut exit_code = 0;
 
@@ -231,6 +232,7 @@ fn parse_ci_args(args: &[String]) -> Result<CiArgs, AppError> {
     let mut format = None;
     let mut output = None;
     let mut growth_rate = None;
+    let mut sample_interval = None;
 
     let mut i = 2; // skip "mvis" and "ci"
     while i < args.len() {
@@ -326,6 +328,18 @@ fn parse_ci_args(args: &[String]) -> Result<CiArgs, AppError> {
                     return Err(AppError::MissingArg("--growth-rate".into()));
                 }
             }
+            "--sample-interval" => {
+                if i + 1 < args.len() {
+                    let val = args[i + 1].parse::<u64>().ok().filter(|&v| v > 0)
+                        .ok_or_else(|| AppError::InvalidArg(
+                            "invalid --sample-interval: expected a positive number of milliseconds".into()
+                        ))?;
+                    sample_interval = Some(val);
+                    i += 2;
+                } else {
+                    return Err(AppError::MissingArg("--sample-interval".into()));
+                }
+            }
             other => {
                 if target.is_none() {
                     target = Some(CiTarget::AttachName(other.to_string()));
@@ -347,6 +361,7 @@ fn parse_ci_args(args: &[String]) -> Result<CiArgs, AppError> {
         format,
         output,
         growth_rate,
+        sample_interval,
     })
 }
 
