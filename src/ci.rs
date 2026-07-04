@@ -23,6 +23,7 @@ struct CiArgs {
     duration: Option<Duration>,
     format: Option<FormatType>,
     output: Option<String>,
+    diff_only: bool,
     /// Bytes per second. Fail if the rolling-window growth rate exceeds this.
     growth_rate: Option<u64>,
     sample_interval: Option<u64>,
@@ -53,6 +54,11 @@ pub fn ci_main(args: &[String]) -> i32 {
     } else {
         None
     };
+
+    if parsed.diff_only && !parsed.leak_check {
+        eprintln!("error: --diff-only requires --leak-check to be active");
+        return 1;
+    }
 
     let start = Instant::now();
     let poll_interval = Duration::from_millis(parsed.sample_interval.unwrap_or(1000));
@@ -163,7 +169,13 @@ pub fn ci_main(args: &[String]) -> i32 {
     // Export report if requested.
     if let Some(ref format_type) = parsed.format {
         if let Some(current_heap) = last_captured_heap {
-            let blocks = current_heap;
+            let mut blocks = current_heap;
+
+            if parsed.diff_only {
+                if let Some(ref prev) = baseline {
+                    blocks = blocks.into_iter().filter(|b| !prev.contains(b)).collect();
+                }
+            }
 
             let target_path = parsed.output.clone().unwrap_or_else(|| match format_type {
                 FormatType::Json => "heap_dump.json".to_string(),
@@ -227,6 +239,7 @@ fn resolve_target(target: &CiTarget) -> Result<(u32, Option<Child>), AppError> {
 fn parse_ci_args(args: &[String]) -> Result<CiArgs, AppError> {
     let mut max_memory = None;
     let mut leak_check = false;
+    let mut diff_only = false;
     let mut duration = None;
     let mut target = None;
     let mut format = None;
@@ -250,6 +263,10 @@ fn parse_ci_args(args: &[String]) -> Result<CiArgs, AppError> {
             }
             "--leak-check" => {
                 leak_check = true;
+                i += 1;
+            }
+            "--diff-only" => {
+                diff_only = true;
                 i += 1;
             }
             "--duration" => {
@@ -357,6 +374,7 @@ fn parse_ci_args(args: &[String]) -> Result<CiArgs, AppError> {
         target,
         max_memory,
         leak_check,
+        diff_only,
         duration,
         format,
         output,

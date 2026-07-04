@@ -50,7 +50,7 @@ pub enum RegionProtect {
     Other,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct HeapBlock {
     pub address: usize,
     pub size: usize,
