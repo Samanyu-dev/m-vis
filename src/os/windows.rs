@@ -139,6 +139,7 @@ pub fn walk_regions(pid: u32) -> Vec<Region> {
 /// A `Vec<HeapBlock>` with address, size, free status, and page protection
 /// for each parsed heap block.
 pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
+    use std::time::{Duration, Instant};
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -150,7 +151,6 @@ pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
     };
-    use std::time::{Duration, Instant};
 
     // --- tunable safety limits ---
     const MAX_BLOCKS_PER_HEAP: usize = 100_000;
@@ -218,7 +218,9 @@ pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
                 }
                 if blocks_this_heap >= MAX_BLOCKS_PER_HEAP {
                     // likely corrupted/hostile heap metadata — stop this heap, move to next
-                    eprintln!("walk_heap: heap at {heap_base:#x} exceeded block cap, skipping rest");
+                    eprintln!(
+                        "walk_heap: heap at {heap_base:#x} exceeded block cap, skipping rest"
+                    );
                     break;
                 }
 
