@@ -150,8 +150,17 @@ pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
     };
+    use std::time::{Duration, Instant};
 
-    let _t = std::time::Instant::now();
+    // --- tunable safety limits ---
+    const MAX_BLOCKS_PER_HEAP: usize = 100_000;
+    const MAX_TOTAL_BLOCKS: usize = 1_000_000;
+    const MAX_WALK_DURATION: Duration = Duration::from_secs(10);
+    const MAX_REGION_SPAN: usize = 512 * 1024 * 1024;
+    const MIN_SIZE_UNITS: usize = 1; // smallest plausible header unit
+    const MAX_SIZE_UNITS: usize = u16::MAX as usize; // header field is u16, so this is already the ceiling
+
+    let start = Instant::now();
     let mut blocks = Vec::with_capacity(50_000);
 
     unsafe {
@@ -159,14 +168,18 @@ pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
         let proc_handle = match OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
         {
             Ok(h) => h,
-            Err(_) => return blocks,
+            Err(e) => {
+                eprintln!("walk_heap: OpenProcess failed for pid {pid}: {e:?}");
+                return blocks;
+            }
         };
 
         // phase 1 — collect heap base addresses via Toolhelp32
         // this is fast because we only enumerate heaps, not blocks
         let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPHEAPLIST, pid) {
             Ok(h) => h,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("walk_heap: CreateToolhelp32Snapshot failed for pid {pid}: {e:?}");
                 CloseHandle(proc_handle).ok();
                 return blocks;
             }
@@ -188,11 +201,27 @@ pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
         }
 
         // phase 2 — for each heap base, walk committed regions and parse headers
-        for heap_base in heap_bases {
+        'heaps: for heap_base in heap_bases {
             let mut addr = heap_base;
+            let mut blocks_this_heap = 0usize;
 
             loop {
                 // query the region at this address
+                // global deadline check — bail out of everything if we've overrun
+                if start.elapsed() > MAX_WALK_DURATION {
+                    eprintln!("walk_heap: exceeded time budget for pid {pid}, aborting walk");
+                    break 'heaps;
+                }
+                if blocks.len() >= MAX_TOTAL_BLOCKS {
+                    eprintln!("walk_heap: exceeded total block cap for pid {pid}, aborting walk");
+                    break 'heaps;
+                }
+                if blocks_this_heap >= MAX_BLOCKS_PER_HEAP {
+                    // likely corrupted/hostile heap metadata — stop this heap, move to next
+                    eprintln!("walk_heap: heap at {heap_base:#x} exceeded block cap, skipping rest");
+                    break;
+                }
+
                 let mut mbi = MEMORY_BASIC_INFORMATION::default();
                 let written = VirtualQueryEx(
                     proc_handle,
@@ -223,15 +252,31 @@ pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
                     if ok.is_ok() && bytes_read >= 8 {
                         let mut offset = 0usize;
                         while offset + 8 <= bytes_read {
-                            let size_units =
-                                u16::from_le_bytes([buf[offset], buf[offset + 1]]) as usize;
-
-                            if size_units == 0 {
+                            if blocks_this_heap >= MAX_BLOCKS_PER_HEAP
+                                || blocks.len() >= MAX_TOTAL_BLOCKS
+                            {
                                 break;
                             }
 
-                            let block_size = size_units * 8;
-                            if offset + block_size > bytes_read {
+                            let size_units =
+                                u16::from_le_bytes([buf[offset], buf[offset + 1]]) as usize;
+
+                            // reject implausible headers instead of trusting them blindly
+                            if size_units < MIN_SIZE_UNITS || size_units > MAX_SIZE_UNITS {
+                                break;
+                            }
+
+                            let block_size = match size_units.checked_mul(8) {
+                                Some(sz) if sz > 0 => sz,
+                                _ => break,
+                            };
+
+                            // checked add guards offset overflow on 32-bit targets too
+                            let next_offset = match offset.checked_add(block_size) {
+                                Some(v) => v,
+                                None => break,
+                            };
+                            if next_offset > bytes_read {
                                 break;
                             }
 
@@ -253,6 +298,7 @@ pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
                             } else {
                                 protect = RegionProtect::Other;
                             }
+
                             blocks.push(HeapBlock {
                                 address: mbi.BaseAddress as usize + offset,
                                 size: block_size,
@@ -260,7 +306,8 @@ pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
                                 vm_protect: protect,
                             });
 
-                            offset += block_size;
+                            blocks_this_heap += 1;
+                            offset = next_offset;
                         }
                     }
                 }
@@ -274,7 +321,7 @@ pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
 
                 // stop when we've moved far from the heap base
                 // heap segments are typically contiguous
-                if addr > heap_base + 512 * 1024 * 1024 {
+                if addr > heap_base.saturating_add(MAX_REGION_SPAN) {
                     break;
                 }
             }
