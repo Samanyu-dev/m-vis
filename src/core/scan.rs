@@ -519,30 +519,36 @@ pub fn leak_command_tui(pid: u32, interval: u64) -> (Vec<Line<'static>>, LeakDel
     let dur = Duration::new(interval, 0);
     sleep(dur);
     let snapshot2 = heap_mode(pid).unwrap_or_default();
-    let growth = diff_heap_size(&snapshot1, &snapshot2);
+
+    let new_allocs = diff_snapshots(&snapshot1, &snapshot2);
+    let new_allocated_bytes: usize = new_allocs.iter().map(|(_, size)| size).sum();
+
     let freed = diff_freed_memory(&snapshot1, &snapshot2);
     let new_freed_memory: usize = freed.iter().map(|(_, size)| size).sum();
+
     let leak_delta = LeakDelta {
         freed_bytes: new_freed_memory,
-        allocated_bytes: growth,
+        allocated_bytes: new_allocated_bytes,
     };
+    let net = leak_delta.net_change();
+
     let leak_delta_output = leak_delta.get_diagnostic_line();
     output.push(Line::raw(leak_delta_output.0.to_string()));
     output.push(Line::raw(format!(
-        "heap growth: {}",
-        format_bytes(growth as u64)
+        "net change: {}{}",
+        if net >= 0 { "+" } else { "-" },
+        format_bytes(net.unsigned_abs() as u64)
     )));
-    if growth > 0 {
+
+    if net > 0 {
         output.push(Line::from(Span::styled(
-            format!(
-                "leak suspected — heap grew by {}",
-                format_bytes(growth as u64)
-            ),
+            format!("leak suspected — heap grew by {}", format_bytes(net as u64)),
             Style::default().fg(Color::Red),
         )));
     } else {
         output.push(Line::raw("no leak detected".to_string()));
     }
+
     (output, leak_delta)
 }
 
