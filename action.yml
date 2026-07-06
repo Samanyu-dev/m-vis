@@ -122,16 +122,21 @@ runs:
         [ -n "${{ inputs.format }}" ]               && ARGS+=(--format "${{ inputs.format }}")
         [ -n "${{ inputs.output }}" ]               && ARGS+=(--output "${{ inputs.output }}")
 
+        CMD_PREFIX="mvis ci"
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          CMD_PREFIX="sudo mvis ci"
+        fi
+
         # target
         if [ -n "${{ inputs.pid }}" ]; then
           ARGS+=(--pid "${{ inputs.pid }}")
-          mvis ci "${ARGS[@]}"
+          $CMD_PREFIX "${ARGS[@]}"
         elif [ -n "${{ inputs.process-name }}" ]; then
           ARGS+=("${{ inputs.process-name }}")
-          mvis ci "${ARGS[@]}"
+          $CMD_PREFIX "${ARGS[@]}"
         elif [ -n "${{ inputs.spawn }}" ]; then
           # --spawn must be last. Use eval so quotes in spawn command are respected properly.
-          cmd="mvis ci"
+          cmd="$CMD_PREFIX"
           for arg in "${ARGS[@]}"; do
             cmd="$cmd $(printf '%q ' "$arg")"
           done
