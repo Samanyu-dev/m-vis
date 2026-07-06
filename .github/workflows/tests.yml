@@ -117,7 +117,7 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             echo "path=$(cygpath -w "$GITHUB_WORKSPACE/tests/test_programs/leak_test_c.exe")" >> "$GITHUB_OUTPUT"
           else
-            echo "path=$GITHUB_WORKSPACE/tests/test_programs/leak_test_c.exe" >> "$GITHUB_OUTPUT"
+            echo "path=$GITHUB_WORKSPACE/tests/test_programs/leak_test_c" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Smoke test | max-memory breach
