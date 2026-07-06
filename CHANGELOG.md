@@ -1,5 +1,11 @@
 # Changelog
-## [0.4.0] - 2026-06-20
+## [0.5.0-rc1] - 2026-07-6
+### Added
+- **CI/CD Mode**: Full programmatic integration layer with JSON/CSV export, differential leak detection (`--diff-only`), configurable sampling, and growth rate monitoring.
+- **Enhanced TUI**: keyboard-driven process selection, quick action buttons.
+- **Improved Leak Detection**: Better Linux heap walk via /proc/maps, optimized memory diff algorithms for large heaps.
+
+## [0.4.0] - 2026-06-30
 ### Added
 - Linux man pages (Makefile)
 - Process Tree View
