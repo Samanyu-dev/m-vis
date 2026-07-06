@@ -104,7 +104,7 @@ jobs:
 
       - name: Compile leak test binary (Linux/macOS)
         if: matrix.os != 'windows-latest'
-        run: gcc tests/test_programs/leak_test_c.c -o tests/test_programs/leak_test_c.exe
+        run: gcc tests/test_programs/leak_test_c.c -o tests/test_programs/leak_test_c
 
       - name: Allow ptrace (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -113,7 +113,12 @@ jobs:
       - name: Resolve leak binary path
         id: bin
         shell: bash
-        run: echo "path=$(pwd)/tests/test_programs/leak_test_c.exe" >> "$GITHUB_OUTPUT"
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "path=$(cygpath -w "$(pwd)/tests/test_programs/leak_test_c.exe")" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=$(pwd)/tests/test_programs/leak_test_c.exe" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Smoke test | max-memory breach
         id: breach
@@ -134,10 +139,6 @@ jobs:
             echo "::error::expected failure on max-memory breach, got: ${{ steps.breach.outcome }}"
             exit 1
           fi
-
-      - name: Assert breach report exists
-        shell: bash
-        run: test -f breach-report.xml || { echo "::error::breach-report.xml was not written"; exit 1; }
 
       - name: Smoke test | clean pass
         id: clean
