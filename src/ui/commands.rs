@@ -238,7 +238,16 @@ fn get_heap_blocks(pid: u32, _granular: bool) -> Vec<HeapBlock> {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        if _granular {
+            crate::os::walk_heap_granular(pid)
+        } else {
+            mem.walk_heap(pid).unwrap_or_default()
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         mem.walk_heap(pid).unwrap_or_default()
     }
