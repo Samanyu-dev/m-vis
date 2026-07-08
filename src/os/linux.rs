@@ -76,8 +76,59 @@ pub fn walk_regions(pid: u32) -> Vec<Region> {
     regions
 }
 
-/// Reads `/proc/<pid>/smaps` and returns heap blocks for the process.
 pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
+    let mut blocks = Vec::new();
+
+    let maps_path = format!("/proc/{}/maps", pid);
+    let maps_content = match fs::read_to_string(&maps_path) {
+        Ok(c) => c,
+        Err(_) => return blocks,
+    };
+
+    let mut heap_start = 0usize;
+    let mut heap_end = 0usize;
+    let mut vm_protect = RegionProtect::NoAccess;
+
+    for line in maps_content.lines() {
+        if !line.contains("[heap]") {
+            continue;
+        }
+
+        let mut parts = line.splitn(6, ' ');
+        let range = parts.next().unwrap_or("");
+        let perms = parts.next().unwrap_or("");
+
+        let mut range_parts = range.split('-');
+        heap_start = usize::from_str_radix(range_parts.next().unwrap_or("0"), 16).unwrap_or(0);
+        heap_end = usize::from_str_radix(range_parts.next().unwrap_or("0"), 16).unwrap_or(0);
+
+        vm_protect = if perms.contains('x') {
+            RegionProtect::Execute
+        } else if perms.contains('w') {
+            RegionProtect::ReadWrite
+        } else if perms.contains('r') {
+            RegionProtect::Readonly
+        } else {
+            RegionProtect::NoAccess
+        };
+
+        break; // only one [heap] entry exists, stop looking
+    }
+
+    if heap_start > 0 && heap_end > heap_start {
+        blocks.push(HeapBlock {
+            address: heap_start,
+            size: heap_end - heap_start,
+            is_free: false,
+            vm_protect,
+        });
+    }
+
+    blocks
+}
+
+/// Reads `/proc/<pid>/smaps` (or `/proc/<pid>/mem`) and returns individual glibc heap chunks.
+pub fn walk_heap_granular(pid: u32) -> Vec<HeapBlock> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut blocks = Vec::new();
