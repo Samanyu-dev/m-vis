@@ -450,26 +450,26 @@ mod tests {
         v.extend(rest.iter().map(|s| s.to_string()));
         v
     }
-    
+
     #[test]
     fn max_memory_converts_mb_to_bytes() {
         let args = argv(&["--max-memory", "64"]);
         let parsed = parse_ci_args(&args).unwrap();
         assert_eq!(parsed.max_memory, Some(64 * 1024 * 1024));
     }
-    
+
     #[test]
     fn max_memory_rejects_non_numeric() {
         let args = argv(&["--max-memory", "not-a-number"]);
         assert!(parse_ci_args(&args).is_err());
     }
-    
+
     #[test]
     fn max_memory_missing_value_errors() {
         let args = argv(&["--max-memory"]);
         assert!(parse_ci_args(&args).is_err());
     }
-    
+
     #[test]
     fn leak_check_and_diff_only_flags_set() {
         let args = argv(&["--leak-check", "--diff-only"]);
@@ -477,14 +477,14 @@ mod tests {
         assert!(parsed.leak_check);
         assert!(parsed.diff_only);
     }
-    
+
     #[test]
     fn duration_parses_seconds() {
         let args = argv(&["--duration", "30"]);
         let parsed = parse_ci_args(&args).unwrap();
         assert_eq!(parsed.duration, Some(Duration::from_secs(30)));
     }
-    
+
     #[test]
     fn pid_target_parses() {
         let args = argv(&["--pid", "4242"]);
@@ -494,13 +494,13 @@ mod tests {
             _ => panic!("expected AttachPid target"),
         }
     }
-    
+
     #[test]
     fn pid_rejects_non_numeric() {
         let args = argv(&["--pid", "abc"]);
         assert!(parse_ci_args(&args).is_err());
     }
-    
+
     #[test]
     fn spawn_captures_command_and_trailing_args() {
         // Regression test: --spawn must take everything after the command
@@ -518,7 +518,7 @@ mod tests {
         // own flags (that was the old consuming-all-remaining-args bug).
         assert!(!parsed.leak_check);
     }
-    
+
     #[test]
     fn spawn_with_no_trailing_args() {
         let args = argv(&["--spawn", "myprog"]);
@@ -531,40 +531,40 @@ mod tests {
             _ => panic!("expected Spawn target"),
         }
     }
-    
+
     #[test]
     fn spawn_missing_command_errors() {
         let args = argv(&["--spawn"]);
         assert!(parse_ci_args(&args).is_err());
     }
-    
+
     #[test]
     fn format_json_parses() {
         let args = argv(&["--format", "json"]);
         let parsed = parse_ci_args(&args).unwrap();
         assert!(matches!(parsed.format, Some(FormatType::Json)));
     }
-    
+
     #[test]
     fn format_csv_parses() {
         let args = argv(&["--format", "csv"]);
         let parsed = parse_ci_args(&args).unwrap();
         assert!(matches!(parsed.format, Some(FormatType::CSV)));
     }
-    
+
     #[test]
     fn format_junit_parses() {
         let args = argv(&["--format", "junit"]);
         let parsed = parse_ci_args(&args).unwrap();
         assert!(matches!(parsed.format, Some(FormatType::Junit)));
     }
-    
+
     #[test]
     fn format_unknown_value_errors() {
         let args = argv(&["--format", "yaml"]);
         assert!(parse_ci_args(&args).is_err());
     }
-    
+
     #[test]
     fn format_missing_value_errors_and_does_not_hang() {
         // Regression test for the old bug where a missing --format value
@@ -572,55 +572,55 @@ mod tests {
         let args = argv(&["--format"]);
         assert!(parse_ci_args(&args).is_err());
     }
-    
+
     #[test]
     fn output_path_parses() {
         let args = argv(&["--output", "report.xml"]);
         let parsed = parse_ci_args(&args).unwrap();
         assert_eq!(parsed.output, Some("report.xml".to_string()));
     }
-    
+
     #[test]
     fn growth_rate_parses() {
         let args = argv(&["--growth-rate", "1024"]);
         let parsed = parse_ci_args(&args).unwrap();
         assert_eq!(parsed.growth_rate, Some(1024));
     }
-    
+
     #[test]
     fn growth_rate_rejects_non_numeric() {
         let args = argv(&["--growth-rate", "fast"]);
         assert!(parse_ci_args(&args).is_err());
     }
-    
+
     #[test]
     fn sample_interval_parses_positive_value() {
         let args = argv(&["--sample-interval", "250"]);
         let parsed = parse_ci_args(&args).unwrap();
         assert_eq!(parsed.sample_interval, Some(250));
     }
-    
+
     #[test]
     fn sample_interval_rejects_zero() {
         let args = argv(&["--sample-interval", "0"]);
         assert!(parse_ci_args(&args).is_err());
     }
-    
+
     #[test]
     fn sample_interval_rejects_negative_and_non_numeric() {
         let args = argv(&["--sample-interval", "-5"]);
         assert!(parse_ci_args(&args).is_err());
-    
+
         let args2 = argv(&["--sample-interval", "soon"]);
         assert!(parse_ci_args(&args2).is_err());
     }
-    
+
     #[test]
     fn sample_interval_missing_value_errors() {
         let args = argv(&["--sample-interval"]);
         assert!(parse_ci_args(&args).is_err());
     }
-    
+
     #[test]
     fn bare_word_becomes_attach_name_target() {
         let args = argv(&["my-process"]);
@@ -630,7 +630,7 @@ mod tests {
             _ => panic!("expected AttachName target"),
         }
     }
-    
+
     #[test]
     fn no_target_defaults_to_empty_attach_name() {
         let args = argv(&["--leak-check"]);
@@ -640,7 +640,7 @@ mod tests {
             _ => panic!("expected default empty AttachName target"),
         }
     }
-    
+
     #[test]
     fn second_bare_word_after_target_errors() {
         // Once a target is set, another unrecognized bare word should be an
@@ -648,19 +648,26 @@ mod tests {
         let args = argv(&["my-process", "another-name"]);
         assert!(parse_ci_args(&args).is_err());
     }
-    
+
     #[test]
     fn combined_flags_all_populate_correctly() {
         let args = argv(&[
-            "--pid", "99",
+            "--pid",
+            "99",
             "--leak-check",
             "--diff-only",
-            "--max-memory", "128",
-            "--duration", "10",
-            "--format", "junit",
-            "--output", "out.xml",
-            "--growth-rate", "2048",
-            "--sample-interval", "500",
+            "--max-memory",
+            "128",
+            "--duration",
+            "10",
+            "--format",
+            "junit",
+            "--output",
+            "out.xml",
+            "--growth-rate",
+            "2048",
+            "--sample-interval",
+            "500",
         ]);
         let parsed = parse_ci_args(&args).unwrap();
         assert!(matches!(parsed.target, CiTarget::AttachPid(99)));
