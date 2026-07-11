@@ -14,6 +14,9 @@ pub use windows::WindowsMemory as PlatformMemory;
 mod linux;
 
 #[cfg(target_os = "linux")]
+pub use linux::walk_heap_granular;
+
+#[cfg(target_os = "linux")]
 pub use linux::LinuxMemory as PlatformMemory;
 
 #[cfg(target_os = "macos")]
