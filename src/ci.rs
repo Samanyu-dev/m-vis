@@ -27,6 +27,7 @@ struct CiArgs {
     /// Bytes per second. Fail if the rolling-window growth rate exceeds this.
     growth_rate: Option<u64>,
     sample_interval: Option<u64>,
+    warm_up: Option<u64>,
 }
 
 pub fn ci_main(args: &[String]) -> i32 {
@@ -47,6 +48,9 @@ pub fn ci_main(args: &[String]) -> i32 {
             return 1;
         }
     };
+
+    let warmup_duration = Duration::from_secs(parsed.warm_up.unwrap_or(0));
+    std::thread::sleep(warmup_duration);
 
     // Baseline for leak check — taken once before the loop.
     let baseline = if parsed.leak_check {
@@ -246,6 +250,7 @@ fn parse_ci_args(args: &[String]) -> Result<CiArgs, AppError> {
     let mut output = None;
     let mut growth_rate = None;
     let mut sample_interval = None;
+    let mut warm_up = None;
 
     let mut i = 2; // skip "mvis" and "ci"
     while i < args.len() {
@@ -357,6 +362,23 @@ fn parse_ci_args(args: &[String]) -> Result<CiArgs, AppError> {
                     return Err(AppError::MissingArg("--sample-interval".into()));
                 }
             }
+            "--warmup" => {
+                if i + 1 < args.len() {
+                    let val = args[i + 1]
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|&v| v > 0)
+                        .ok_or_else(|| {
+                            AppError::InvalidArg(
+                                "invalid --warmup: expected a positive number of seconds".into(),
+                            )
+                        })?;
+                    warm_up = Some(val);
+                    i += 2;
+                } else {
+                    return Err(AppError::MissingArg("--warmup-interval".into()));
+                }
+            }
             other => {
                 if target.is_none() {
                     target = Some(CiTarget::AttachName(other.to_string()));
@@ -380,6 +402,7 @@ fn parse_ci_args(args: &[String]) -> Result<CiArgs, AppError> {
         output,
         growth_rate,
         sample_interval,
+        warm_up,
     })
 }
 
@@ -646,6 +669,18 @@ mod tests {
         // Once a target is set, another unrecognized bare word should be an
         // unknown-argument error, not silently accepted as a second target.
         let args = argv(&["my-process", "another-name"]);
+        assert!(parse_ci_args(&args).is_err());
+    }
+    #[test]
+    fn warmup_parses_positive_value() {
+        let args = argv(&["--warmup", "3"]);
+        let parsed = parse_ci_args(&args).unwrap();
+        assert_eq!(parsed.warm_up, Some(3));
+    }
+
+    #[test]
+    fn warmup_rejects_zero() {
+        let args = argv(&["--warmup", "0"]);
         assert!(parse_ci_args(&args).is_err());
     }
 
