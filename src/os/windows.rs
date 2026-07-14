@@ -70,7 +70,10 @@ pub fn walk_regions(pid: u32) -> Result<Vec<Region>, String> {
     loop {
         region_count += 1;
         if region_count % 10_000 == 0 {
-            eprintln!("walk_regions: processed {} regions for pid {}", region_count, pid);
+            eprintln!(
+                "walk_regions: processed {} regions for pid {}",
+                region_count, pid
+            );
         }
         if region_count > MAX_REGIONS_PER_PROCESS {
             return Err("Process has too many regions".into());
