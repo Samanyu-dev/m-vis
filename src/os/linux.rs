@@ -81,8 +81,7 @@ pub fn walk_regions(pid: u32) -> Result<Vec<Region>, String> {
             name: region_name,
         });
     }
-
-    regions
+    Ok(regions)
 }
 
 pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
