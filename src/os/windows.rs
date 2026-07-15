@@ -26,7 +26,7 @@ pub struct WindowsMemory;
 
 impl MemoryProvider for WindowsMemory {
     fn walk_regions(&self, pid: u32) -> Result<Vec<Region>, String> {
-        Ok(walk_regions(pid))
+        walk_regions(pid)
     }
 
     fn walk_heap(&self, pid: u32) -> Result<Vec<HeapBlock>, String> {
@@ -57,15 +57,27 @@ impl MemoryProvider for WindowsMemory {
 /// # Panics
 /// Panics if `OpenProcess` fails — the process may not exist or access
 /// may be denied. Use a process you have `PROCESS_QUERY_INFORMATION` rights to.
-pub fn walk_regions(pid: u32) -> Vec<Region> {
+pub fn walk_regions(pid: u32) -> Result<Vec<Region>, String> {
     let handle = unsafe {
         OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
             .expect("failed to load process")
     };
     let mut regions = Vec::new();
     let mut addr: usize = 0;
+    let mut region_count = 0;
+    const MAX_REGIONS_PER_PROCESS: usize = 100_000;
 
     loop {
+        region_count += 1;
+        if region_count % 10_000 == 0 {
+            eprintln!(
+                "walk_regions: processed {} regions for pid {}",
+                region_count, pid
+            );
+        }
+        if region_count > MAX_REGIONS_PER_PROCESS {
+            return Err("Process has too many regions".into());
+        }
         let mut mbi = MEMORY_BASIC_INFORMATION::default();
         let written = unsafe {
             VirtualQueryEx(
@@ -124,7 +136,7 @@ pub fn walk_regions(pid: u32) -> Vec<Region> {
             break;
         }
     }
-    regions
+    Ok(regions)
 }
 /// Walks all heap blocks in a process using `ReadProcessMemory` for performance.
 ///
@@ -491,7 +503,7 @@ pub fn list_modules(pid: u32, flag: String) -> Vec<ModuleInfo> {
         };
 
         // walk regions and collect image regions grouped by path
-        let regions = walk_regions(pid);
+        let regions = walk_regions(pid).unwrap_or_default();
         for region in regions
             .iter()
             .filter(|r| r.kind == RegionKind::Image && !r.name.is_empty())

@@ -56,8 +56,20 @@ impl MemoryProvider for MacMemory {
 
         let mut regions = Vec::new();
         let mut address: mach2::vm_types::mach_vm_address_t = 1; // start at 1 to skip the zero page
+        let mut region_count = 0;
+        const MAX_REGIONS_PER_PROCESS: usize = 100_000;
 
         loop {
+            region_count += 1;
+            if region_count % 10_000 == 0 {
+                eprintln!(
+                    "walk_regions: processed {} regions for pid {}",
+                    region_count, pid
+                );
+            }
+            if region_count > MAX_REGIONS_PER_PROCESS {
+                return Err("Process has too many regions".into());
+            }
             let mut size: mach2::vm_types::mach_vm_size_t = 0;
             let mut info: vm_region_basic_info_64 = unsafe { mem::zeroed() };
             // FIX: use natural_t (u32) as the unit, not i32

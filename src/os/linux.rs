@@ -9,7 +9,7 @@ pub struct LinuxMemory;
 
 impl MemoryProvider for LinuxMemory {
     fn walk_regions(&self, pid: u32) -> Result<Vec<Region>, String> {
-        Ok(walk_regions(pid))
+        walk_regions(pid)
     }
 
     fn walk_heap(&self, pid: u32) -> Result<Vec<HeapBlock>, String> {
@@ -22,12 +22,24 @@ impl MemoryProvider for LinuxMemory {
 }
 
 /// Reads `/proc/<pid>/maps` and returns all mapped virtual memory regions for the process.
-pub fn walk_regions(pid: u32) -> Vec<Region> {
+pub fn walk_regions(pid: u32) -> Result<Vec<Region>, String> {
     let path = format!("/proc/{}/maps", pid);
-    let content = fs::read_to_string(path).expect("failed to read maps");
+    let content = fs::read_to_string(path).map_err(|e| format!("failed to read maps: {}", e))?;
     let mut regions = Vec::new();
+    let mut region_count = 0;
+    const MAX_REGIONS_PER_PROCESS: usize = 100_000;
 
     for line in content.lines() {
+        region_count += 1;
+        if region_count % 10_000 == 0 {
+            eprintln!(
+                "walk_regions: processed {} regions for pid {}",
+                region_count, pid
+            );
+        }
+        if region_count > MAX_REGIONS_PER_PROCESS {
+            return Err("Process has too many regions".into());
+        }
         // each line looks like:
         // 55a3b2000000-55a3b2001000 r--p 00000000 08:01 123456  /usr/bin/cat
         let mut parts = line.splitn(6, ' ');
@@ -72,8 +84,7 @@ pub fn walk_regions(pid: u32) -> Vec<Region> {
             name: region_name,
         });
     }
-
-    regions
+    Ok(regions)
 }
 
 pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
