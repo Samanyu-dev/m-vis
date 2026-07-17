@@ -1,10 +1,11 @@
 use crate::core::scan::{diff_heap_size, heap_mode};
-use crate::export::{FormatType, heap_to_csv_file, heap_to_json_file, heap_to_junit_file};
+use crate::export::{CheckResult, FormatType, heap_to_csv_file, heap_to_json_file, heap_to_junit_file};
 use crate::utils::error::AppError;
 use crate::utils::process::{FuzzyMatch, fuzzy_find_pid};
 use std::collections::VecDeque;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
+use std::error::Error;
 use sysinfo::System;
 
 // How far back the rolling window looks when computing growth rate.
@@ -68,6 +69,7 @@ pub fn ci_main(args: &[String]) -> i32 {
     let poll_interval = Duration::from_millis(parsed.sample_interval.unwrap_or(1000));
     let mut sys = System::new_all();
     let mut exit_code = 0;
+    let mut failed_check: Option<(&'static str, String)> = None;
 
     // Rolling window for --growth-rate: stores (sample_time, total_heap_bytes).
     // Entries older than GROWTH_WINDOW_SECS are evicted each iteration.
@@ -104,6 +106,14 @@ pub fn ci_main(args: &[String]) -> i32 {
                         max_mem / (1024 * 1024),
                         current_mem as f64 / (1024.0 * 1024.0)
                     );
+                    failed_check = Some((
+                        "max-memory",
+                        format!(
+                            "limit {} MB exceeded, current {:.2} MB",
+                            max_mem / (1024 * 1024),
+                            current_mem as f64 / (1024.0 * 1024.0)
+                        ),
+                    ));
                     exit_code = 2;
                     break;
                 }
@@ -120,10 +130,12 @@ pub fn ci_main(args: &[String]) -> i32 {
                 let growth = diff_heap_size(prev, current);
                 if growth > 0 {
                     eprintln!("error: memory leak detected! Heap grew by {} bytes", growth);
+                    failed_check = Some(("leak-check", format!("heap grew by {} bytes", growth)));
                     exit_code = 2;
                     break;
                 }
             }
+            
         }
 
         // Enforce --growth-rate using a rolling window.
@@ -155,6 +167,13 @@ pub fn ci_main(args: &[String]) -> i32 {
                                 "error: heap growth rate exceeded. Limit: {} B/s, Current: {} B/s (over {:.1}s window)",
                                 rate_limit, rate, elapsed_secs
                             );
+                            failed_check = Some((
+                                "growth-rate",
+                                format!(
+                                    "rate {} B/s exceeded limit {} B/s (over {:.1}s window)",
+                                    rate, rate_limit, elapsed_secs
+                                ),
+                            ));
                             exit_code = 2;
                             break;
                         }
@@ -170,30 +189,67 @@ pub fn ci_main(args: &[String]) -> i32 {
         std::thread::sleep(poll_interval);
     }
 
+    let mut check_results: Vec<CheckResult> = Vec::new();
+    if parsed.leak_check {
+        let (passed, message) = match &failed_check {
+            Some((name, msg)) if *name == "leak-check" => (false, Some(msg.clone())),
+            _ => (true, None),
+        };
+        check_results.push(CheckResult { name: "leak-check".to_string(), passed, message });
+    }
+    if parsed.growth_rate.is_some() {
+        let (passed, message) = match &failed_check {
+            Some((name, msg)) if *name == "growth-rate" => (false, Some(msg.clone())),
+            _ => (true, None),
+        };
+        check_results.push(CheckResult { name: "growth-rate".to_string(), passed, message });
+    }
+    if parsed.max_memory.is_some() {
+        let (passed, message) = match &failed_check {
+            Some((name, msg)) if *name == "max-memory" => (false, Some(msg.clone())),
+            _ => (true, None),
+        };
+        check_results.push(CheckResult { name: "max-memory".to_string(), passed, message });
+    }
+
     // Export report if requested.
     if let Some(ref format_type) = parsed.format {
-        if let Some(current_heap) = last_captured_heap {
-            let mut blocks = current_heap;
-
-            if parsed.diff_only {
-                if let Some(ref prev) = baseline {
-                    blocks = blocks.into_iter().filter(|b| !prev.contains(b)).collect();
+        let export_result: Option<(String, Result<(), Box<dyn Error>>)> = match format_type {
+            FormatType::Junit => {
+                let target_path = parsed
+                    .output
+                    .clone()
+                    .unwrap_or_else(|| "heap_dump.xml".to_string());
+                Some((target_path.clone(), heap_to_junit_file(&target_path, check_results)))
+            }
+            FormatType::Json | FormatType::CSV => {
+                if let Some(current_heap) = last_captured_heap {
+                    let mut blocks = current_heap;
+                    if parsed.diff_only {
+                        if let Some(ref prev) = baseline {
+                            blocks = blocks.into_iter().filter(|b| !prev.contains(b)).collect();
+                        }
+                    }
+                    let target_path = parsed.output.clone().unwrap_or_else(|| match format_type {
+                        FormatType::Json => "heap_dump.json".to_string(),
+                        FormatType::CSV => "heap_dump.csv".to_string(),
+                        FormatType::Junit => unreachable!(),
+                    });
+                    let result = match format_type {
+                        FormatType::Json => heap_to_json_file(&target_path, blocks),
+                        FormatType::CSV => heap_to_csv_file(&target_path, blocks),
+                        FormatType::Junit => unreachable!(),
+                    };
+                    Some((target_path, result))
+                } else {
+                    eprintln!("warning: no heap snapshot was captured; skipping export");
+                    None
                 }
             }
+        };
 
-            let target_path = parsed.output.clone().unwrap_or_else(|| match format_type {
-                FormatType::Json => "heap_dump.json".to_string(),
-                FormatType::CSV => "heap_dump.csv".to_string(),
-                FormatType::Junit => "heap_dump.xml".to_string(),
-            });
-
-            let export_result = match format_type {
-                FormatType::Json => heap_to_json_file(&target_path, blocks),
-                FormatType::CSV => heap_to_csv_file(&target_path, blocks),
-                FormatType::Junit => heap_to_junit_file(&target_path, blocks),
-            };
-
-            match export_result {
+        if let Some((target_path, result)) = export_result {
+            match result {
                 Ok(_) => println!("Successfully wrote report to: {}", target_path),
                 Err(e) => {
                     eprintln!("failed to export report to {}: {}", target_path, e);
@@ -202,8 +258,6 @@ pub fn ci_main(args: &[String]) -> i32 {
                     }
                 }
             }
-        } else {
-            eprintln!("warning: no heap snapshot was captured; skipping export");
         }
     }
 
@@ -376,7 +430,7 @@ fn parse_ci_args(args: &[String]) -> Result<CiArgs, AppError> {
                     warm_up = Some(val);
                     i += 2;
                 } else {
-                    return Err(AppError::MissingArg("--warmup-interval".into()));
+                    return Err(AppError::MissingArg("--warmup".into()));
                 }
             }
             other => {
@@ -681,6 +735,11 @@ mod tests {
     #[test]
     fn warmup_rejects_zero() {
         let args = argv(&["--warmup", "0"]);
+        assert!(parse_ci_args(&args).is_err());
+    }
+    #[test]
+    fn warmup_missing_value_errors_and_does_not_hang() {
+        let args = argv(&["--warmup"]);
         assert!(parse_ci_args(&args).is_err());
     }
 

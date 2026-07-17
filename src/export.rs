@@ -5,6 +5,13 @@ use std::fs;
 use std::fs::File;
 use std::path::Path;
 
+#[derive(Debug, Clone)]
+pub struct CheckResult {
+    pub name: String,
+    pub passed: bool,
+    pub message: Option<String>,
+}
+
 pub enum FormatType {
     Json,
     CSV,
@@ -101,37 +108,25 @@ pub fn region_to_csv_file<P: AsRef<Path>>(
 
 pub fn heap_to_junit_file<P: AsRef<Path>>(
     file_path: P,
-    blocks: Vec<HeapBlock>,
+    results: Vec<CheckResult>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut report = Report::new("mvis-heap-analysis");
-    let mut suite = TestSuite::new("heap-blocks");
+    let mut report = Report::new("mvis-ci-checks");
+    let mut suite = TestSuite::new("memory-checks");
 
-    for block in &blocks {
-        let case_name = format!("block@{:#x}", block.address);
-
-        let status = if block.is_free {
+    for r in results {
+        let status = if r.passed {
             TestCaseStatus::success()
         } else {
-            let description = format!(
-                "Active (non-freed) heap block: address={:#x}, size={} bytes, protect={:?}",
-                block.address, block.size, block.vm_protect
-            );
             let mut s = TestCaseStatus::non_success(NonSuccessKind::Failure);
-            s.set_message(description);
+            if let Some(msg) = r.message {
+                s.set_message(msg);
+            }
             s
         };
-
-        let mut case = TestCase::new(case_name, status);
-        case.add_property(("address", format!("{:#x}", block.address).as_str()));
-        case.add_property(("size_bytes", block.size.to_string().as_str()));
-        case.add_property(("is_free", block.is_free.to_string().as_str()));
-        case.add_property(("vm_protect", format!("{:?}", block.vm_protect).as_str()));
-
-        suite.add_test_case(case);
+        suite.add_test_case(TestCase::new(r.name, status));
     }
 
     report.add_test_suite(suite);
-
     let xml = report.to_string()?;
     fs::write(file_path, xml)?;
     Ok(())
