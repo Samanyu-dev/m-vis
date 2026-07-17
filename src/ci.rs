@@ -1,11 +1,13 @@
 use crate::core::scan::{diff_heap_size, heap_mode};
-use crate::export::{CheckResult, FormatType, heap_to_csv_file, heap_to_json_file, heap_to_junit_file};
+use crate::export::{
+    CheckResult, FormatType, heap_to_csv_file, heap_to_json_file, heap_to_junit_file,
+};
 use crate::utils::error::AppError;
 use crate::utils::process::{FuzzyMatch, fuzzy_find_pid};
 use std::collections::VecDeque;
+use std::error::Error;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
-use std::error::Error;
 use sysinfo::System;
 
 // How far back the rolling window looks when computing growth rate.
@@ -135,7 +137,6 @@ pub fn ci_main(args: &[String]) -> i32 {
                     break;
                 }
             }
-            
         }
 
         // Enforce --growth-rate using a rolling window.
@@ -195,21 +196,33 @@ pub fn ci_main(args: &[String]) -> i32 {
             Some((name, msg)) if *name == "leak-check" => (false, Some(msg.clone())),
             _ => (true, None),
         };
-        check_results.push(CheckResult { name: "leak-check".to_string(), passed, message });
+        check_results.push(CheckResult {
+            name: "leak-check".to_string(),
+            passed,
+            message,
+        });
     }
     if parsed.growth_rate.is_some() {
         let (passed, message) = match &failed_check {
             Some((name, msg)) if *name == "growth-rate" => (false, Some(msg.clone())),
             _ => (true, None),
         };
-        check_results.push(CheckResult { name: "growth-rate".to_string(), passed, message });
+        check_results.push(CheckResult {
+            name: "growth-rate".to_string(),
+            passed,
+            message,
+        });
     }
     if parsed.max_memory.is_some() {
         let (passed, message) = match &failed_check {
             Some((name, msg)) if *name == "max-memory" => (false, Some(msg.clone())),
             _ => (true, None),
         };
-        check_results.push(CheckResult { name: "max-memory".to_string(), passed, message });
+        check_results.push(CheckResult {
+            name: "max-memory".to_string(),
+            passed,
+            message,
+        });
     }
 
     // Export report if requested.
@@ -220,7 +233,10 @@ pub fn ci_main(args: &[String]) -> i32 {
                     .output
                     .clone()
                     .unwrap_or_else(|| "heap_dump.xml".to_string());
-                Some((target_path.clone(), heap_to_junit_file(&target_path, check_results)))
+                Some((
+                    target_path.clone(),
+                    heap_to_junit_file(&target_path, check_results),
+                ))
             }
             FormatType::Json | FormatType::CSV => {
                 if let Some(current_heap) = last_captured_heap {
