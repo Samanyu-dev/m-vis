@@ -208,25 +208,6 @@ pub fn list_processes(args: Vec<&str>) -> Result<Vec<String>, String> {
     Ok(output)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{is_worker_thread_name, process_name_is_visible};
-
-    #[test]
-    fn detects_rayon_worker_threads() {
-        assert!(is_worker_thread_name("rayon-worker"));
-        assert!(is_worker_thread_name("rayon-worker-3"));
-        assert!(!is_worker_thread_name("worker-service"));
-    }
-
-    #[test]
-    fn hides_worker_threads_before_filtering() {
-        assert!(!process_name_is_visible("rayon-worker", None));
-        assert!(!process_name_is_visible("rayon-worker", Some("rayon")));
-        assert!(process_name_is_visible("cargo", Some("car")));
-    }
-}
-
 fn get_heap_blocks(pid: u32, _granular: bool) -> Vec<HeapBlock> {
     let mem = os::provider();
     #[cfg(target_os = "windows")]
@@ -250,5 +231,24 @@ fn get_heap_blocks(pid: u32, _granular: bool) -> Vec<HeapBlock> {
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         mem.walk_heap(pid).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_worker_thread_name, process_name_is_visible};
+
+    #[test]
+    fn detects_rayon_worker_threads() {
+        assert!(is_worker_thread_name("rayon-worker"));
+        assert!(is_worker_thread_name("rayon-worker-3"));
+        assert!(!is_worker_thread_name("worker-service"));
+    }
+
+    #[test]
+    fn hides_worker_threads_before_filtering() {
+        assert!(!process_name_is_visible("rayon-worker", None));
+        assert!(!process_name_is_visible("rayon-worker", Some("rayon")));
+        assert!(process_name_is_visible("cargo", Some("car")));
     }
 }

@@ -89,11 +89,22 @@ struct App {
     prompt: Option<PromptState>,
     watch_target: Option<String>,
     watch_mode: Option<String>,
+    // Flame Chart State
+    flame_snapshot: Option<std::sync::Arc<crate::ui::flame_chart::snapshot::FlameSnapshot>>,
+    flame_snapshot_rx: std::sync::Arc<
+        std::sync::RwLock<Option<std::sync::Arc<crate::ui::flame_chart::snapshot::FlameSnapshot>>>,
+    >,
+    flame_navigator: crate::ui::flame_chart::navigation::FlameNavigator,
+    flame_metric: crate::ui::flame_chart::layout::Metric,
+    flame_color_mode: crate::ui::flame_chart::colors::ColorMode,
+    last_flame_layout: Option<crate::ui::flame_chart::layout::FlameLayout>,
+    flame_diagnostics: bool,
 }
 enum HeapViewMode {
     Metrics,     // high-level view
     Allocations, // table view
     Chart,       // Chart
+    FlameChart,  // Flame Chart
 }
 enum InputMode {
     Normal,
@@ -168,6 +179,13 @@ impl App {
             prompt: None,
             watch_target: None,
             watch_mode: None,
+            flame_snapshot: None,
+            flame_snapshot_rx: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            flame_navigator: crate::ui::flame_chart::navigation::FlameNavigator::new(),
+            flame_metric: crate::ui::flame_chart::layout::Metric::LiveBytes,
+            flame_color_mode: crate::ui::flame_chart::colors::ColorMode::Depth,
+            last_flame_layout: None,
+            flame_diagnostics: false,
         };
         app.push_message("mvis ready. type 'help' for commands.".into());
         app
@@ -1035,6 +1053,65 @@ impl App {
             if crossterm::event::poll(std::time::Duration::from_millis(100))?
                 && let Some(key) = event::read()?.as_key_press_event()
             {
+                let mut handled = false;
+                if matches!(self.input_mode, InputMode::Normal)
+                    && matches!(self.heap_view_mode, HeapViewMode::FlameChart)
+                {
+                    match key.code {
+                        KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Enter
+                        | KeyCode::Esc => {
+                            if let Some(layout) = &self.last_flame_layout {
+                                self.flame_navigator.handle_key(key.code, layout);
+                            }
+                            handled = true;
+                        }
+                        KeyCode::Char('m') => {
+                            self.flame_metric = match self.flame_metric {
+                                crate::ui::flame_chart::layout::Metric::LiveBytes => {
+                                    crate::ui::flame_chart::layout::Metric::TotalBytes
+                                }
+                                crate::ui::flame_chart::layout::Metric::TotalBytes => {
+                                    crate::ui::flame_chart::layout::Metric::PeakLiveBytes
+                                }
+                                crate::ui::flame_chart::layout::Metric::PeakLiveBytes => {
+                                    crate::ui::flame_chart::layout::Metric::LiveBytes
+                                }
+                            };
+                            handled = true;
+                        }
+                        KeyCode::Char('c') => {
+                            self.flame_color_mode = match self.flame_color_mode {
+                                crate::ui::flame_chart::colors::ColorMode::Depth => {
+                                    crate::ui::flame_chart::colors::ColorMode::Module
+                                }
+                                crate::ui::flame_chart::colors::ColorMode::Module => {
+                                    crate::ui::flame_chart::colors::ColorMode::Bytes
+                                }
+                                crate::ui::flame_chart::colors::ColorMode::Bytes => {
+                                    crate::ui::flame_chart::colors::ColorMode::Mono
+                                }
+                                crate::ui::flame_chart::colors::ColorMode::Mono => {
+                                    crate::ui::flame_chart::colors::ColorMode::Depth
+                                }
+                            };
+                            handled = true;
+                        }
+                        KeyCode::Char('i') => {
+                            self.flame_diagnostics = !self.flame_diagnostics;
+                            handled = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if handled {
+                    continue;
+                }
+
                 match self.input_mode {
                     InputMode::Normal => match key.code {
                         KeyCode::Char('e') => self.input_mode = InputMode::Editing,
@@ -1045,8 +1122,9 @@ impl App {
                         KeyCode::Tab => {
                             self.heap_view_mode = match self.heap_view_mode {
                                 HeapViewMode::Metrics => HeapViewMode::Allocations,
-                                HeapViewMode::Allocations => HeapViewMode::Chart,
-                                HeapViewMode::Chart => HeapViewMode::Metrics,
+                                HeapViewMode::Allocations => HeapViewMode::FlameChart,
+                                HeapViewMode::FlameChart => HeapViewMode::Metrics,
+                                HeapViewMode::Chart => HeapViewMode::Metrics, // Keep Chart fallback for now
                             };
                         }
                         KeyCode::Char('p') => self.set_focus(Focus::ProcList),
@@ -1130,6 +1208,12 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
+        if let Ok(mut rx) = self.flame_snapshot_rx.try_write()
+            && let Some(snapshot) = rx.take()
+        {
+            self.flame_snapshot = Some(snapshot);
+        }
+
         frame.render_widget(
             ratatui::widgets::Paragraph::new("")
                 .style(Style::default().bg(self.theme.bg).fg(self.theme.text)),
@@ -1438,6 +1522,110 @@ impl App {
                     innerlayout[1],
                 );
             }
+        } else if matches!(self.heap_view_mode, HeapViewMode::FlameChart) {
+            let title = match self.flame_metric {
+                crate::ui::flame_chart::layout::Metric::LiveBytes => "Live",
+                crate::ui::flame_chart::layout::Metric::TotalBytes => "Total",
+                crate::ui::flame_chart::layout::Metric::PeakLiveBytes => "Peak",
+            };
+            let color_mode = match self.flame_color_mode {
+                crate::ui::flame_chart::colors::ColorMode::Depth => "Depth Colors",
+                crate::ui::flame_chart::colors::ColorMode::Module => "Module Colors",
+                crate::ui::flame_chart::colors::ColorMode::Bytes => "Bytes Colors",
+                crate::ui::flame_chart::colors::ColorMode::Mono => "Mono Colors",
+            };
+            let focus_str = if self.flame_navigator.focused_node.is_some() {
+                "Focused"
+            } else {
+                "Root"
+            };
+
+            let full_title = format!(
+                "Heap View — Flame Chart  {} │ {} │ Focus: {}",
+                title, color_mode, focus_str
+            );
+
+            let block = ratatui::widgets::Block::bordered()
+                .border_style(Style::default().fg(self.theme.border))
+                .title(full_title)
+                .fg(self.theme.healthy);
+
+            let inner_area = block.inner(innerlayout[1]);
+            frame.render_widget(block, innerlayout[1]);
+
+            if let Some(snapshot) = &self.flame_snapshot {
+                let layout = crate::ui::flame_chart::layout::FlameLayout::build(
+                    snapshot,
+                    inner_area.width,
+                    match self.flame_metric {
+                        crate::ui::flame_chart::layout::Metric::LiveBytes => {
+                            crate::ui::flame_chart::layout::Metric::LiveBytes
+                        }
+                        crate::ui::flame_chart::layout::Metric::TotalBytes => {
+                            crate::ui::flame_chart::layout::Metric::TotalBytes
+                        }
+                        crate::ui::flame_chart::layout::Metric::PeakLiveBytes => {
+                            crate::ui::flame_chart::layout::Metric::PeakLiveBytes
+                        }
+                    },
+                    self.flame_navigator.focused_node.and_then(|id| {
+                        // We need the frame id to focus, but focused_node is NodeId
+                        // The navigator should store the frame ID, or we need to find it from the last layout
+                        // For simplicity, let's look it up in the last layout
+                        self.last_flame_layout
+                            .as_ref()
+                            .and_then(|l| l.nodes.iter().find(|n| n.id == id).map(|n| n.frame))
+                    }),
+                );
+
+                let widget = crate::ui::flame_chart::renderer::FlameChartWidget::new(
+                    &layout,
+                    &snapshot.symbols,
+                    Some(&self.flame_navigator),
+                    self.flame_color_mode,
+                );
+                frame.render_widget(widget, inner_area);
+
+                if self.flame_diagnostics {
+                    let max_depth = layout.nodes.iter().map(|n| n.depth).max().unwrap_or(0);
+                    let diag_lines = vec![
+                        Line::raw("── Diagnostics ──────"),
+                        Line::raw(format!("Nodes    : {}", layout.nodes.len())),
+                        Line::raw(format!("Depth    : {}", max_depth)),
+                        Line::raw(format!("Metric   : {}", title)),
+                    ];
+                    let diag_w = 25;
+                    let diag_h = diag_lines.len() as u16 + 2;
+                    let diag_x = inner_area.x + inner_area.width.saturating_sub(diag_w + 1);
+                    let diag_y = inner_area.y + 1;
+
+                    if inner_area.width > diag_w + 5 && inner_area.height > diag_h + 2 {
+                        let diag_area = ratatui::layout::Rect::new(diag_x, diag_y, diag_w, diag_h);
+                        frame.render_widget(ratatui::widgets::Clear, diag_area);
+                        frame.render_widget(
+                            Paragraph::new(diag_lines)
+                                .block(
+                                    ratatui::widgets::Block::bordered().border_style(
+                                        Style::default().fg(self.theme.growth_warning),
+                                    ),
+                                )
+                                .style(Style::default().bg(self.theme.bg).fg(self.theme.text)),
+                            diag_area,
+                        );
+                    }
+                }
+
+                self.last_flame_layout = Some(layout);
+            } else {
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::raw("No flame chart snapshot available."),
+                        Line::raw("Run tracing to collect data."),
+                    ])
+                    .style(Style::default().bg(self.theme.bg).fg(self.theme.text)),
+                    inner_area,
+                );
+            }
         } else {
             let heap_lines = match &self.heap_history.last() {
                 None => vec![Line::raw("No heap data."), Line::raw("Run: scan <proc> -h")],
@@ -1456,6 +1644,7 @@ impl App {
                             &self.theme,
                         ),
                         HeapViewMode::Chart => unreachable!(),
+                        HeapViewMode::FlameChart => unreachable!(),
                     }
                 }
             };
@@ -1468,6 +1657,7 @@ impl App {
                             HeapViewMode::Metrics => "Heap View [Tab for table]",
                             HeapViewMode::Allocations => "Heap View [Tab for metrics]",
                             HeapViewMode::Chart => unreachable!(),
+                            HeapViewMode::FlameChart => unreachable!(),
                         })
                         .fg(self.theme.healthy),
                 ),

@@ -43,10 +43,7 @@ impl MacMemory {
     }
 
     fn get_region_name(&self, pid: u32, address: usize) -> String {
-        match libproc::libproc::proc_pid::regionfilename(pid as i32, address as u64) {
-            Ok(name) => name,
-            Err(_) => String::new(),
-        }
+        libproc::libproc::proc_pid::regionfilename(pid as i32, address as u64).unwrap_or_default()
     }
 }
 
@@ -227,23 +224,21 @@ impl MemoryProvider for MacMemory {
                 || r.name.contains("Frameworks")
                 || r.name.contains("dyld");
 
-            if !r.name.is_empty() && is_module {
-                if seen.insert(r.name.clone()) {
-                    let path = Path::new(&r.name);
-                    let file_name = path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
+            if !r.name.is_empty() && is_module && seen.insert(r.name.clone()) {
+                let path = Path::new(&r.name);
+                let file_name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
 
-                    modules.push(ModuleInfo {
-                        base: r.base,
-                        size: r.size,
-                        name: file_name,
-                        path: r.name,
-                        status: ModuleStatus::Ok,
-                    });
-                }
+                modules.push(ModuleInfo {
+                    base: r.base,
+                    size: r.size,
+                    name: file_name,
+                    path: r.name,
+                    status: ModuleStatus::Ok,
+                });
             }
         }
         Ok(modules)

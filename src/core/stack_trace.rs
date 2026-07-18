@@ -381,7 +381,9 @@ mod windows {
                 if windows::Win32::System::Diagnostics::Debug::GetThreadContext(thread_handle, ctx)
                     .is_ok()
                 {
-                    if let Ok(frames) = capture_from_context(proc_handle, thread_handle, ctx, regions) {
+                    if let Ok(frames) =
+                        capture_from_context(proc_handle, thread_handle, ctx, regions)
+                    {
                         all_frames.extend(frames);
                     }
                 }
@@ -469,7 +471,6 @@ mod windows {
         }
         Ok(frames)
     }
-
 
     fn get_thread_ids(pid: u32) -> Vec<u32> {
         let mut threads = Vec::new();

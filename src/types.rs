@@ -83,14 +83,49 @@ pub struct ModuleInfo {
     pub status: ModuleStatus,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct AllocationEvent {
-    pub address: usize,
-    pub size: usize,
+pub type FrameId = u32;
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize)]
+pub struct FrameKey {
+    pub module_base: usize,
+    pub instruction_pointer: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct AllocationTrace {
-    pub event: AllocationEvent,
-    pub frames: Vec<crate::core::stack_trace::StackFrame>,
+pub enum AllocationEvent {
+    Alloc {
+        address: usize,
+        size: usize,
+        thread_id: u32,
+        sequence: u64,
+        stack: Vec<FrameKey>,
+    },
+    Free {
+        address: usize,
+        thread_id: u32,
+        sequence: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum TracingMode {
+    EveryAllocation,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FlameNode {
+    pub frame: FrameId,
+    pub live_bytes: u64,
+    pub total_bytes: u64,
+    pub peak_live_bytes: u64,
+    pub live_count: u64,
+    pub total_count: u64,
+    pub children: std::collections::HashMap<FrameId, FlameNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SymbolInfo {
+    pub name: String,
+    pub module: String,
+    pub address: usize,
 }

@@ -1,0 +1,60 @@
+--- src/core/alloc_trace.rs
++++ src/core/alloc_trace.rs
+@@ -10,10 +10,10 @@
+     use windows::Win32::System::Threading::{OpenThread, OpenProcess, THREAD_ALL_ACCESS, PROCESS_ALL_ACCESS, SuspendThread, ResumeThread, CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+     use windows::core::s;
+-    use crate::types::{AllocationTrace, AllocationEvent};
++    use crate::types::AllocationEvent;
+     use crate::core::stack_trace::{StackTrace, capture_from_context};
+     use std::collections::HashMap;
+ 
+-    pub fn trace_allocations(pid: u32, duration_secs: u64, regions: &[crate::types::Region]) -> Result<Vec<AllocationTrace>, String> {
+-        let mut traces = Vec::new();
++    pub fn trace_allocations(pid: u32, duration_secs: u64, regions: &[crate::types::Region], tx: std::sync::mpsc::Sender<AllocationEvent>) -> Result<(), String> {
+         unsafe {
+             let h_mod = GetModuleHandleA(s!("ntdll.dll")).map_err(|e| e.to_string())?;
+@@ -93,12 +93,8 @@
+                                         let size = ctx.R8 as usize; // arg 3
+                                         // Capture stack trace
+-                                        if let Ok(frames) = capture_from_context(proc_handle, th, &mut ctx, regions) {
+-                                            traces.push(AllocationTrace {
+-                                                event: AllocationEvent {
+-                                                    address: 0, // returned from RtlAllocateHeap later, but we only have size here
+-                                                    size,
+-                                                },
+-                                                frames,
+-                                            });
+-                                        }
++                                        let _ = tx.send(AllocationEvent::Alloc {
++                                            address: 0,
++                                            size,
++                                            thread_id: event.dwThreadId,
++                                            sequence: 0,
++                                            stack: std::sync::Arc::new([]),
++                                        });
+                                         
+@@ -128,5 +124,5 @@
+             DebugActiveProcessStop(pid).ok();
+         }
+-        Ok(traces)
++        Ok(())
+     }
+ }
+@@ -134,6 +130,6 @@
+ mod linux {
+-    use crate::types::{AllocationTrace, Region};
+-    pub fn trace_allocations(pid: u32, duration_secs: u64, regions: &[Region]) -> Result<Vec<AllocationTrace>, String> {
++    use crate::types::{AllocationEvent, Region};
++    pub fn trace_allocations(_pid: u32, _duration_secs: u64, _regions: &[Region], _tx: std::sync::mpsc::Sender<AllocationEvent>) -> Result<(), String> {
+         // TODO: Implement ptrace-based hardware breakpoint on malloc
+         Err("Linux allocation tracing is not yet implemented".to_string())
+     }
+@@ -143,6 +139,6 @@
+ mod macos {
+-    use crate::types::{AllocationTrace, Region};
+-    pub fn trace_allocations(pid: u32, duration_secs: u64, regions: &[Region]) -> Result<Vec<AllocationTrace>, String> {
++    use crate::types::{AllocationEvent, Region};
++    pub fn trace_allocations(_pid: u32, _duration_secs: u64, _regions: &[Region], _tx: std::sync::mpsc::Sender<AllocationEvent>) -> Result<(), String> {
+         Err("macOS allocation tracing is not yet implemented".to_string())
+     }
+ }

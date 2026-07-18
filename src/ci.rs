@@ -79,10 +79,10 @@ pub fn ci_main(args: &[String]) -> i32 {
 
     loop {
         // Check if duration elapsed.
-        if let Some(dur) = parsed.duration {
-            if start.elapsed() >= dur {
-                break;
-            }
+        if let Some(dur) = parsed.duration
+            && start.elapsed() >= dur
+        {
+            break;
         }
 
         // Check if process exited.
@@ -92,33 +92,33 @@ pub fn ci_main(args: &[String]) -> i32 {
         }
 
         // If we spawned the child, also check try_wait().
-        if let Some(ref mut c) = child {
-            if let Ok(Some(_)) = c.try_wait() {
-                break;
-            }
+        if let Some(ref mut c) = child
+            && let Ok(Some(_)) = c.try_wait()
+        {
+            break;
         }
 
         // Enforce --max-memory.
-        if let Some(max_mem) = parsed.max_memory {
-            if let Some(process) = sys.process(sysinfo::Pid::from_u32(pid)) {
-                let current_mem = process.memory();
-                if current_mem > max_mem {
-                    eprintln!(
-                        "error: memory limit exceeded. Max: {} MB, Current: {:.2} MB",
+        if let Some(max_mem) = parsed.max_memory
+            && let Some(process) = sys.process(sysinfo::Pid::from_u32(pid))
+        {
+            let current_mem = process.memory();
+            if current_mem > max_mem {
+                eprintln!(
+                    "error: memory limit exceeded. Max: {} MB, Current: {:.2} MB",
+                    max_mem / (1024 * 1024),
+                    current_mem as f64 / (1024.0 * 1024.0)
+                );
+                failed_check = Some((
+                    "max-memory",
+                    format!(
+                        "limit {} MB exceeded, current {:.2} MB",
                         max_mem / (1024 * 1024),
                         current_mem as f64 / (1024.0 * 1024.0)
-                    );
-                    failed_check = Some((
-                        "max-memory",
-                        format!(
-                            "limit {} MB exceeded, current {:.2} MB",
-                            max_mem / (1024 * 1024),
-                            current_mem as f64 / (1024.0 * 1024.0)
-                        ),
-                    ));
-                    exit_code = 2;
-                    break;
-                }
+                    ),
+                ));
+                exit_code = 2;
+                break;
             }
         }
 
@@ -127,57 +127,57 @@ pub fn ci_main(args: &[String]) -> i32 {
         let current_heap = heap_mode(pid).ok();
 
         // Enforce --leak-check.
-        if parsed.leak_check {
-            if let (Some(prev), Some(current)) = (&baseline, &current_heap) {
-                let growth = diff_heap_size(prev, current);
-                if growth > 0 {
-                    eprintln!("error: memory leak detected! Heap grew by {} bytes", growth);
-                    failed_check = Some(("leak-check", format!("heap grew by {} bytes", growth)));
-                    exit_code = 2;
-                    break;
-                }
+        if parsed.leak_check
+            && let (Some(prev), Some(current)) = (&baseline, &current_heap)
+        {
+            let growth = diff_heap_size(prev, current);
+            if growth > 0 {
+                eprintln!("error: memory leak detected! Heap grew by {} bytes", growth);
+                failed_check = Some(("leak-check", format!("heap grew by {} bytes", growth)));
+                exit_code = 2;
+                break;
             }
         }
 
         // Enforce --growth-rate using a rolling window.
-        if let Some(rate_limit) = parsed.growth_rate {
-            if let Some(process) = sys.process(sysinfo::Pid::from_u32(pid)) {
-                let mem_bytes = process.memory();
-                let now = Instant::now();
-                heap_samples.push_back((now, mem_bytes));
+        if let Some(rate_limit) = parsed.growth_rate
+            && let Some(process) = sys.process(sysinfo::Pid::from_u32(pid))
+        {
+            let mem_bytes = process.memory();
+            let now = Instant::now();
+            heap_samples.push_back((now, mem_bytes));
 
-                let window = Duration::from_secs(GROWTH_WINDOW_SECS);
-                while heap_samples
-                    .front()
-                    .map(|(t, _)| now.duration_since(*t) > window)
-                    .unwrap_or(false)
-                {
-                    heap_samples.pop_front();
-                }
+            let window = Duration::from_secs(GROWTH_WINDOW_SECS);
+            while heap_samples
+                .front()
+                .map(|(t, _)| now.duration_since(*t) > window)
+                .unwrap_or(false)
+            {
+                heap_samples.pop_front();
+            }
 
-                if heap_samples.len() >= 2 {
-                    let (oldest_time, oldest_bytes) = heap_samples.front().unwrap();
-                    let elapsed_secs = now.duration_since(*oldest_time).as_secs_f64();
+            if heap_samples.len() >= 2 {
+                let (oldest_time, oldest_bytes) = heap_samples.front().unwrap();
+                let elapsed_secs = now.duration_since(*oldest_time).as_secs_f64();
 
-                    if elapsed_secs >= 1.0 {
-                        let byte_delta = mem_bytes.saturating_sub(*oldest_bytes);
-                        let rate = (byte_delta as f64 / elapsed_secs) as u64;
+                if elapsed_secs >= 1.0 {
+                    let byte_delta = mem_bytes.saturating_sub(*oldest_bytes);
+                    let rate = (byte_delta as f64 / elapsed_secs) as u64;
 
-                        if rate > rate_limit {
-                            eprintln!(
-                                "error: heap growth rate exceeded. Limit: {} B/s, Current: {} B/s (over {:.1}s window)",
-                                rate_limit, rate, elapsed_secs
-                            );
-                            failed_check = Some((
-                                "growth-rate",
-                                format!(
-                                    "rate {} B/s exceeded limit {} B/s (over {:.1}s window)",
-                                    rate, rate_limit, elapsed_secs
-                                ),
-                            ));
-                            exit_code = 2;
-                            break;
-                        }
+                    if rate > rate_limit {
+                        eprintln!(
+                            "error: heap growth rate exceeded. Limit: {} B/s, Current: {} B/s (over {:.1}s window)",
+                            rate_limit, rate, elapsed_secs
+                        );
+                        failed_check = Some((
+                            "growth-rate",
+                            format!(
+                                "rate {} B/s exceeded limit {} B/s (over {:.1}s window)",
+                                rate, rate_limit, elapsed_secs
+                            ),
+                        ));
+                        exit_code = 2;
+                        break;
                     }
                 }
             }
@@ -241,10 +241,10 @@ pub fn ci_main(args: &[String]) -> i32 {
             FormatType::Json | FormatType::CSV => {
                 if let Some(current_heap) = last_captured_heap {
                     let mut blocks = current_heap;
-                    if parsed.diff_only {
-                        if let Some(ref prev) = baseline {
-                            blocks = blocks.into_iter().filter(|b| !prev.contains(b)).collect();
-                        }
+                    if parsed.diff_only
+                        && let Some(ref prev) = baseline
+                    {
+                        blocks.retain(|b| !prev.contains(b));
                     }
                     let target_path = parsed.output.clone().unwrap_or_else(|| match format_type {
                         FormatType::Json => "heap_dump.json".to_string(),

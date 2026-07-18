@@ -10,7 +10,7 @@ use std::process::Command;
 /// Helper to run mvis command
 fn run_mvis(args: &[&str]) -> std::process::Output {
     Command::new("cargo")
-        .args(&["run", "--release", "--"])
+        .args(["run", "--release", "--"])
         .args(args)
         .output()
         .expect("Failed to execute mvis command")

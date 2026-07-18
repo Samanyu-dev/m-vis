@@ -1,3 +1,4 @@
+pub mod aggregator;
 pub mod alloc_trace;
 pub mod delta;
 pub mod scan;
