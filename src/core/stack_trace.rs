@@ -381,59 +381,8 @@ mod windows {
                 if windows::Win32::System::Diagnostics::Debug::GetThreadContext(thread_handle, ctx)
                     .is_ok()
                 {
-                    // set up initial stack frame
-                    let mut sf = STACKFRAME64::default();
-                    sf.AddrPC.Offset = ctx.Rip;
-                    sf.AddrPC.Mode = AddrModeFlat;
-                    sf.AddrFrame.Offset = ctx.Rbp;
-                    sf.AddrFrame.Mode = AddrModeFlat;
-                    sf.AddrStack.Offset = ctx.Rsp;
-                    sf.AddrStack.Mode = AddrModeFlat;
-                    // walk up to 64 frames
-                    for _ in 0..64 {
-                        let ok = StackWalk64(
-                            IMAGE_FILE_MACHINE_AMD64.0 as u32,
-                            proc_handle,
-                            thread_handle,
-                            &mut sf,
-                            ctx as *mut _ as *mut _,
-                            None,
-                            None,
-                            None,
-                            None,
-                        );
-                        if !ok.as_bool() {
-                            break;
-                        }
-
-                        let ip = sf.AddrPC.Offset as usize;
-                        if ip == 0 {
-                            break;
-                        }
-
-                        // resolve symbol name
-                        let sym_size = std::mem::size_of::<SYMBOL_INFO>() + 256;
-                        let mut sym_buf = vec![0u8; sym_size];
-                        let sym = sym_buf.as_mut_ptr() as *mut SYMBOL_INFO;
-                        (*sym).SizeOfStruct = std::mem::size_of::<SYMBOL_INFO>() as u32;
-                        (*sym).MaxNameLen = 255;
-
-                        let symbol = if SymFromAddr(proc_handle, ip as u64, None, sym).is_ok() {
-                            let name_len = (*sym).NameLen as usize;
-                            let name_ptr = (*sym).Name.as_ptr() as *const u8;
-                            let slice = std::slice::from_raw_parts(name_ptr, name_len);
-                            String::from_utf8_lossy(slice).to_string()
-                        } else {
-                            // fall back to region-based resolution
-                            super::resolve(ip, regions)
-                        };
-
-                        all_frames.push(StackFrame {
-                            instruction_pointer: ip,
-                            base_pointer: sf.AddrFrame.Offset as usize,
-                            return_address: sf.AddrReturn.Offset as usize,
-                            symbol,
-                        });
+                    if let Ok(frames) = capture_from_context(proc_handle, thread_handle, ctx, regions) {
+                        all_frames.extend(frames);
                     }
                 }
 
@@ -453,6 +402,74 @@ mod windows {
             })
         }
     }
+
+    /// Captures a stack trace for a specific thread given its context.
+    pub fn capture_from_context(
+        proc_handle: HANDLE,
+        thread_handle: HANDLE,
+        ctx: &mut CONTEXT,
+        regions: &[crate::types::Region],
+    ) -> Result<Vec<StackFrame>, String> {
+        let mut frames = Vec::new();
+        unsafe {
+            // set up initial stack frame
+            let mut sf = STACKFRAME64::default();
+            sf.AddrPC.Offset = ctx.Rip;
+            sf.AddrPC.Mode = AddrModeFlat;
+            sf.AddrFrame.Offset = ctx.Rbp;
+            sf.AddrFrame.Mode = AddrModeFlat;
+            sf.AddrStack.Offset = ctx.Rsp;
+            sf.AddrStack.Mode = AddrModeFlat;
+            // walk up to 64 frames
+            for _ in 0..64 {
+                let ok = StackWalk64(
+                    IMAGE_FILE_MACHINE_AMD64.0 as u32,
+                    proc_handle,
+                    thread_handle,
+                    &mut sf,
+                    ctx as *mut _ as *mut _,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                if !ok.as_bool() {
+                    break;
+                }
+
+                let ip = sf.AddrPC.Offset as usize;
+                if ip == 0 {
+                    break;
+                }
+
+                // resolve symbol name
+                let sym_size = std::mem::size_of::<SYMBOL_INFO>() + 256;
+                let mut sym_buf = vec![0u8; sym_size];
+                let sym = sym_buf.as_mut_ptr() as *mut SYMBOL_INFO;
+                (*sym).SizeOfStruct = std::mem::size_of::<SYMBOL_INFO>() as u32;
+                (*sym).MaxNameLen = 255;
+
+                let symbol = if SymFromAddr(proc_handle, ip as u64, None, sym).is_ok() {
+                    let name_len = (*sym).NameLen as usize;
+                    let name_ptr = (*sym).Name.as_ptr() as *const u8;
+                    let slice = std::slice::from_raw_parts(name_ptr, name_len);
+                    String::from_utf8_lossy(slice).to_string()
+                } else {
+                    // fall back to region-based resolution
+                    super::resolve(ip, regions)
+                };
+
+                frames.push(StackFrame {
+                    instruction_pointer: ip,
+                    base_pointer: sf.AddrFrame.Offset as usize,
+                    return_address: sf.AddrReturn.Offset as usize,
+                    symbol,
+                });
+            }
+        }
+        Ok(frames)
+    }
+
 
     fn get_thread_ids(pid: u32) -> Vec<u32> {
         let mut threads = Vec::new();

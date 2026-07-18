@@ -82,3 +82,15 @@ pub struct ModuleInfo {
     pub path: String,
     pub status: ModuleStatus,
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AllocationEvent {
+    pub address: usize,
+    pub size: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AllocationTrace {
+    pub event: AllocationEvent,
+    pub frames: Vec<crate::core::stack_trace::StackFrame>,
+}
