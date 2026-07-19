@@ -24,6 +24,19 @@ inputs:
     required: false
 
   # --- monitoring flags ---
+  growth-rate:
+    description: Max heap growth rate in bytes/sec before failing (rolling window)
+    required: false
+  sample-interval:
+    description: Polling interval in milliseconds between samples (default 1000)
+    required: false
+  diff-only:
+    description: Only export blocks not present in the leak-check baseline (requires leak-check)
+    required: false
+    default: 'false'
+  warmup:
+    description: Seconds to wait after attach/spawn before monitoring begins
+    required: false
   max-memory:
     description: Memory limit in megabytes before failing (e.g. 100 for 100 MB)
     required: false
@@ -117,6 +130,10 @@ runs:
         [ -n "${{ inputs.max-memory }}" ]           && ARGS+=(--max-memory "${{ inputs.max-memory }}")
         [ "${{ inputs.leak-check }}" = "true" ]     && ARGS+=(--leak-check)
         [ -n "${{ inputs.duration }}" ]             && ARGS+=(--duration "${{ inputs.duration }}")
+        [ -n "${{ inputs.growth-rate }}" ]          && ARGS+=(--growth-rate "${{ inputs.growth-rate }}")
+        [ -n "${{ inputs.sample-interval }}" ]      && ARGS+=(--sample-interval "${{ inputs.sample-interval }}")
+        [ "${{ inputs.diff-only }}" = "true" ]      && ARGS+=(--diff-only)
+        [ -n "${{ inputs.warmup }}" ]               && ARGS+=(--warmup "${{ inputs.warmup }}")
 
         # export flags
         [ -n "${{ inputs.format }}" ]               && ARGS+=(--format "${{ inputs.format }}")
@@ -158,6 +175,10 @@ runs:
         if ("${{ inputs.max-memory }}")                    { $mvisArgs += "--max-memory", "${{ inputs.max-memory }}" }
         if ("${{ inputs.leak-check }}" -eq "true")         { $mvisArgs += "--leak-check" }
         if ("${{ inputs.duration }}")                      { $mvisArgs += "--duration", "${{ inputs.duration }}" }
+        if ("${{ inputs.growth-rate }}")                   { $mvisArgs += "--growth-rate", "${{ inputs.growth-rate }}" }
+        if ("${{ inputs.sample-interval }}")               { $mvisArgs += "--sample-interval", "${{ inputs.sample-interval }}" }
+        if ("${{ inputs.diff-only }}" -eq "true")          { $mvisArgs += "--diff-only" }
+        if ("${{ inputs.warmup }}")                        { $mvisArgs += "--warmup", "${{ inputs.warmup }}" }
 
         # export flags
         if ("${{ inputs.format }}")                        { $mvisArgs += "--format", "${{ inputs.format }}" }
