@@ -81,10 +81,12 @@ struct App {
     theme: Theme,
     tree_rows: Vec<TreeDisplayRow>,
     tree_selected: usize,
+    tree_scroll: usize,
     tree_collapsed: std::collections::HashSet<u32>,
     tree_total_memory: u64,
     proc_list: Vec<String>,
     proc_list_selected: usize,
+    proc_list_scroll: usize,
     focus: Focus,
     prompt: Option<PromptState>,
     watch_target: Option<String>,
@@ -160,10 +162,12 @@ impl App {
             theme,
             tree_rows: vec![],
             tree_selected: 0,
+            tree_scroll: 0,
             tree_collapsed: std::collections::HashSet::new(),
             tree_total_memory: 0,
             proc_list: vec![],
             proc_list_selected: 0,
+            proc_list_scroll: 0,
             focus: Focus::AllocTable,
             prompt: None,
             watch_target: None,
@@ -421,6 +425,7 @@ impl App {
                 if self.proc_list_selected >= self.proc_list.len() {
                     self.proc_list_selected = self.proc_list.len().saturating_sub(1);
                 }
+                self.proc_list_scroll = self.proc_list_scroll.min(self.proc_list_selected);
             }
             Err(e) => self.push_message(format!("Error: {e}")),
         }
@@ -469,6 +474,7 @@ impl App {
             if self.tree_selected >= self.tree_rows.len() {
                 self.tree_selected = self.tree_rows.len().saturating_sub(1);
             }
+            self.tree_scroll = self.tree_scroll.min(self.tree_selected);
         }
     }
 
@@ -1290,6 +1296,18 @@ impl App {
                 self.tree_total_memory,
                 &self.theme,
             );
+
+            let inner_height = processlayout[1].height.saturating_sub(2) as usize; // minus borders
+            let header_footer = 4usize;
+            let visible_rows = inner_height.saturating_sub(header_footer);
+            if visible_rows > 0 {
+                if self.tree_selected < self.tree_scroll {
+                    self.tree_scroll = self.tree_selected;
+                } else if self.tree_selected >= self.tree_scroll + visible_rows {
+                    self.tree_scroll = self.tree_selected + 1 - visible_rows;
+                }
+            }
+
             frame.render_widget(
                 Paragraph::new(tree_lines)
                     .block(
@@ -1297,13 +1315,24 @@ impl App {
                             .border_style(Style::default().bg(self.theme.bg).fg(self.theme.border))
                             .title("Process Tree [t to toggle]"),
                     )
-                    .style(Style::default().bg(self.theme.bg).fg(self.theme.cyan)),
+                    .style(Style::default().bg(self.theme.bg).fg(self.theme.cyan))
+                    .scroll((self.tree_scroll as u16, 0)),
                 processlayout[1],
             );
         } else {
             if self.proc_list.is_empty() {
                 self.refresh_proc_list();
             }
+
+            let inner_height = processlayout[1].height.saturating_sub(2) as usize; // minus borders
+            if inner_height > 0 {
+                if self.proc_list_selected < self.proc_list_scroll {
+                    self.proc_list_scroll = self.proc_list_selected;
+                } else if self.proc_list_selected >= self.proc_list_scroll + inner_height {
+                    self.proc_list_scroll = self.proc_list_selected + 1 - inner_height;
+                }
+            }
+
             let list_lines: Vec<Line> = self
                 .proc_list
                 .iter()
@@ -1335,7 +1364,8 @@ impl App {
                             .border_style(Style::default().bg(self.theme.bg).fg(self.theme.border))
                             .title(title),
                     )
-                    .style(Style::default().bg(self.theme.bg).fg(self.theme.cyan)),
+                    .style(Style::default().bg(self.theme.bg).fg(self.theme.cyan))
+                    .scroll((self.proc_list_scroll as u16, 0)),
                 processlayout[1],
             );
         }
@@ -1444,7 +1474,7 @@ impl App {
                 Some(snap) => {
                     let panel_height = innerlayout[1].height as usize;
                     self.alloc_table_page_size = panel_height.saturating_sub(6);
-                    let w = innerlayout[1].width as usize;
+                    let w = innerlayout[1].width.saturating_sub(2) as usize;
 
                     match self.heap_view_mode {
                         HeapViewMode::Metrics => render_heap_metrics(snap, w, &self.theme),
