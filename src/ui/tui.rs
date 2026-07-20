@@ -14,6 +14,7 @@ use crate::types::{HeapBlock, RegionProtect};
 use crate::ui::commands::ScanResult;
 use crate::ui::theme::{Theme, ThemeKind};
 use crate::utils::formatting::{format_bytes, format_bytes_i64};
+use crate::utils::loader::load_heap_snapshot;
 use crate::utils::process::{TreeDisplayRow, build_process_tree, flatten_tree};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -588,6 +589,74 @@ impl App {
                                     .growth_critical),
                             ))))
                             .ok();
+                        }
+                    };
+                });
+            }
+            ["diff", file_a, file_b] => {
+                let path_a = file_a.to_string();
+                let path_b = file_b.to_string();
+                let tx = self.tx.clone();
+
+                std::thread::spawn(move || {
+                    let result = (|| -> Result<(Vec<HeapBlock>, ScanResult), String> {
+                        let a = load_heap_snapshot(&path_a)
+                            .map_err(|e| format!("{}: {}", path_a, e))?;
+                        let b = load_heap_snapshot(&path_b)
+                            .map_err(|e| format!("{}: {}", path_b, e))?;
+                        Ok((a.blocks, b))
+                    })();
+
+                    match result {
+                        Ok((baseline_blocks, current)) => {
+                            tx.send(AppEvent::DiffResult(baseline_blocks, current)).ok();
+                        }
+                        Err(e) => {
+                            tx.send(AppEvent::Output(Line::raw(format!("error: {e}"))))
+                                .ok();
+                        }
+                    }
+                });
+            }
+            ["save", _proc, _file] => {
+                let query = "scan".to_string();
+                let proc = _proc.to_string();
+                let mode = "-h".to_string();
+                let path = _file.to_string();
+                let tx = self.tx.clone();
+
+                self.push_message(format!("scanning {} to save as {}...", proc, path));
+
+                std::thread::spawn(move || {
+                    let parts_ref: Vec<&str> = vec![&query, &proc, &mode];
+                    match commands::scan(parts_ref) {
+                        Ok(result) => match serde_json::to_string_pretty(&result) {
+                            Ok(json) => match std::fs::write(&path, json) {
+                                Ok(()) => {
+                                    tx.send(AppEvent::Output(Line::raw(format!(
+                                        "saved snapshot to {}",
+                                        path
+                                    ))))
+                                    .ok();
+                                }
+                                Err(e) => {
+                                    tx.send(AppEvent::Output(Line::raw(format!(
+                                        "failed to write {}: {}",
+                                        path, e
+                                    ))))
+                                    .ok();
+                                }
+                            },
+                            Err(e) => {
+                                tx.send(AppEvent::Output(Line::raw(format!(
+                                    "failed to serialize snapshot: {}",
+                                    e
+                                ))))
+                                .ok();
+                            }
+                        },
+                        Err(e) => {
+                            tx.send(AppEvent::Output(Line::raw(e.to_string()))).ok();
                         }
                     };
                 });

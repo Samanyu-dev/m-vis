@@ -191,6 +191,7 @@ fn run() -> Result<(), AppError> {
         "tui" => {
             let _ = tui_main(theme_kind);
         }
+        "diff" => {}
         _ => {
             return Err(AppError::UnknownCommand(command.to_string()));
         }

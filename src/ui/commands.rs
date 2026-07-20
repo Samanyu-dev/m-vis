@@ -7,7 +7,9 @@ use crate::types::HeapBlock;
 use crate::utils::formatting::format_bytes;
 use ratatui::text::Line;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ScanResult {
+    #[serde(skip)]
     pub lines: Vec<Line<'static>>,
     pub pid: u32,
     pub memory_mb: u64,
