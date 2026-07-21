@@ -14,6 +14,8 @@ use mvis::ci::ci_main;
 use mvis::core::scan::{leak_command, leak_m_command, scan_with_modes};
 use mvis::os;
 use mvis::os::MemoryProvider;
+use mvis::ui::commands;
+use mvis::ui::commands::ScanResult;
 use mvis::ui::commands::process_is_visible;
 use mvis::ui::tui::tui_main;
 use mvis::utils::error::AppError;
@@ -191,7 +193,28 @@ fn run() -> Result<(), AppError> {
         "tui" => {
             let _ = tui_main(theme_kind);
         }
-        "diff" => {}
+        "diff" => {
+            let file_a = get_arg(&args, 2, "file 1")?;
+            let file_b = get_arg(&args, 3, "file 2")?;
+
+            let baseline = load_snapshot(file_a)?;
+            let current = load_snapshot(file_b)?;
+
+            print_diff(&baseline, &current);
+        }
+        "save" => {
+            let queryp = get_arg(&args, 2, "process name")?;
+            let file = get_arg(&args, 3, "output file")?;
+
+            let parts: Vec<&str> = vec!["scan", queryp, "-h"];
+            let result = commands::scan(parts).map_err(AppError::Other)?;
+
+            let json = serde_json::to_string_pretty(&result)
+                .map_err(|e| AppError::Other(e.to_string()))?;
+            std::fs::write(file, json).map_err(|e| AppError::Other(e.to_string()))?;
+
+            println!("saved snapshot to {}", file);
+        }
         _ => {
             return Err(AppError::UnknownCommand(command.to_string()));
         }
@@ -267,6 +290,73 @@ fn parse_positive_u64_arg(args: &[String], index: usize, name: &str) -> Result<u
         )));
     }
     Ok(parsed)
+}
+
+fn load_snapshot(path: &str) -> Result<ScanResult, AppError> {
+    let data =
+        std::fs::read_to_string(path).map_err(|e| AppError::Other(format!("{}: {}", path, e)))?;
+    serde_json::from_str(&data)
+        .map_err(|e| AppError::Other(format!("{}: invalid snapshot ({})", path, e)))
+}
+
+fn print_diff(baseline: &ScanResult, current: &ScanResult) {
+    use mvis::utils::formatting::format_bytes_i64;
+    use std::collections::HashSet;
+
+    let baseline_addrs: HashSet<usize> = baseline
+        .blocks
+        .iter()
+        .filter(|b| !b.is_free)
+        .map(|b| b.address)
+        .collect();
+    let current_addrs: HashSet<usize> = current
+        .blocks
+        .iter()
+        .filter(|b| !b.is_free)
+        .map(|b| b.address)
+        .collect();
+
+    let new_blocks: Vec<_> = current
+        .blocks
+        .iter()
+        .filter(|b| !b.is_free && !baseline_addrs.contains(&b.address))
+        .collect();
+    let removed_blocks: Vec<_> = baseline
+        .blocks
+        .iter()
+        .filter(|b| !b.is_free && !current_addrs.contains(&b.address))
+        .collect();
+
+    let new_bytes: usize = new_blocks.iter().map(|b| b.size).sum();
+    let removed_bytes: usize = removed_blocks.iter().map(|b| b.size).sum();
+    let net: i64 = new_bytes as i64 - removed_bytes as i64;
+
+    println!("baseline : {} blocks", baseline_addrs.len());
+    println!("current  : {} blocks", current_addrs.len());
+    println!("{}", "-".repeat(40));
+    println!(
+        "+{} new blocks (+{})",
+        new_blocks.len(),
+        format_bytes(new_bytes as u64)
+    );
+    println!(
+        "-{} removed blocks (-{})",
+        removed_blocks.len(),
+        format_bytes(removed_bytes as u64)
+    );
+    println!(
+        "net growth: {}{}",
+        if net > 0 { "+" } else { "" },
+        format_bytes_i64(net)
+    );
+
+    if net > 1024 * 1024 {
+        println!("LEAK CONFIRMED — significant growth");
+    } else if net > 0 {
+        println!("growth detected — monitor over time");
+    } else {
+        println!("no growth — heap stable");
+    }
 }
 
 fn print_help_all() {
