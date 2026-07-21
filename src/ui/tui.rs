@@ -92,6 +92,7 @@ struct App {
     prompt: Option<PromptState>,
     watch_target: Option<String>,
     watch_mode: Option<String>,
+    swap_panels: bool,
 }
 enum HeapViewMode {
     Metrics,     // high-level view
@@ -173,6 +174,7 @@ impl App {
             prompt: None,
             watch_target: None,
             watch_mode: None,
+            swap_panels: false,
         };
         app.push_message("mvis ready. type 'help' for commands.".into());
         app
@@ -871,6 +873,9 @@ impl App {
                 self.push_message("  list                      list processes".into());
                 self.push_message("  clear                     clear output history".into());
                 self.push_message("  [t key]                   toggle process tree view".into());
+                self.push_message(
+                    "  [x key]                   swap output/heap view panels".into(),
+                );
             }
             _ => {
                 self.push_message(format!("unknown command: {}", parts.join(" ")));
@@ -1115,6 +1120,7 @@ impl App {
                         KeyCode::Char('e') => self.input_mode = InputMode::Editing,
                         KeyCode::Char('q') => return Ok(()),
                         KeyCode::Char('t') => self.set_focus(Focus::Tree),
+                        KeyCode::Char('x') => self.swap_panels = !self.swap_panels,
                         KeyCode::Up => self.scroll_up(),
                         KeyCode::Down => self.scroll_down(),
                         KeyCode::Tab => {
@@ -1229,10 +1235,15 @@ impl App {
 
         let help_area = layout[0];
         let input_area = layout[1];
-        let messages_area = layout[2];
         let footer = layout[3];
 
-        self.messages_height = messages_area.height.saturating_sub(2);
+        let (log_area, heap_area) = if self.swap_panels {
+            (innerlayout[1], layout[2])
+        } else {
+            (layout[2], innerlayout[1])
+        };
+
+        self.messages_height = log_area.height.saturating_sub(2);
 
         let (msg, style) = match self.input_mode {
             InputMode::Normal => (
@@ -1299,7 +1310,7 @@ impl App {
             .scroll((self.scroll_offset, 0))
             .wrap(Wrap { trim: false });
 
-        frame.render_widget(messages_widget, messages_area);
+        frame.render_widget(messages_widget, log_area);
 
         let proc_lines = match &self.current_proc {
             Some(name) => {
@@ -1463,7 +1474,7 @@ impl App {
                             .title("Leak Delta [Tab for metrics]")
                             .fg(self.theme.healthy),
                     ),
-                    innerlayout[1],
+                    heap_area,
                 );
             } else {
                 let data: Vec<(f64, f64)> = raw
@@ -1503,7 +1514,7 @@ impl App {
                         DiagnosticSeverity::Reclaimed => self.theme.blue,
                         DiagnosticSeverity::Healthy => self.theme.healthy,
                     };
-                    let panel_w = innerlayout[1].width as usize;
+                    let panel_w = heap_area.width as usize;
                     let short = if msg.len() + 6 > panel_w {
                         format!("  {}", &msg[..panel_w.saturating_sub(6)])
                     } else {
@@ -1534,16 +1545,16 @@ impl App {
                                 .bounds([y_min, y_max])
                                 .labels([label_bot.as_str(), "0", label_top.as_str()]),
                         ),
-                    innerlayout[1],
+                    heap_area,
                 );
             }
         } else {
             let heap_lines = match &self.heap_history.last() {
                 None => vec![Line::raw("No heap data."), Line::raw("Run: scan <proc> -h")],
                 Some(snap) => {
-                    let panel_height = innerlayout[1].height as usize;
+                    let panel_height = heap_area.height as usize;
                     self.alloc_table_page_size = panel_height.saturating_sub(6);
-                    let w = innerlayout[1].width.saturating_sub(2) as usize;
+                    let w = heap_area.width.saturating_sub(2) as usize;
 
                     match self.heap_view_mode {
                         HeapViewMode::Metrics => render_heap_metrics(snap, w, &self.theme),
@@ -1570,7 +1581,7 @@ impl App {
                         })
                         .fg(self.theme.healthy),
                 ),
-                innerlayout[1],
+                heap_area,
             );
 
             if let Some(p) = &self.prompt {
@@ -1663,6 +1674,7 @@ impl App {
                     }
                 }
                 spans.extend(hint("t/p", "toggle tree/proclist"));
+                spans.extend(hint("x", "swap output/heap panels"));
                 Line::from(spans)
             }
             InputMode::Editing => Line::from(vec![
@@ -2395,5 +2407,12 @@ mod tests {
                 .iter()
                 .any(|l| l.to_string().contains("Total group memory"))
         );
+    }
+    #[test]
+    fn swap_panels_toggles() {
+        let mut app = make_app();
+        assert!(!app.swap_panels);
+        app.swap_panels = !app.swap_panels;
+        assert!(app.swap_panels);
     }
 }
