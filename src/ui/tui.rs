@@ -19,6 +19,15 @@ use crate::utils::process::{TreeDisplayRow, build_process_tree, flatten_tree};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+const SIZE_BUCKETS: [(&str, usize, usize); 6] = [
+    ("0-64B", 0, 64),
+    ("65-512B", 64, 512),
+    ("513B-4KB", 512, 4 * 1024),
+    ("4-64KB", 4 * 1024, 64 * 1024),
+    ("64KB-1MB", 64 * 1024, 1024 * 1024),
+    (">1MB", 1024 * 1024, usize::MAX),
+];
+
 enum AppEvent {
     DiffResult(Vec<HeapBlock>, ScanResult),
     BaseLine(ScanResult),
@@ -72,6 +81,7 @@ struct App {
     alloc_table_page_size: usize, // rows per page, derived from panel height
     alloc_table_selected: usize,  // highlighted row
     heap_view_mode: HeapViewMode,
+    histogram_selected: usize,
     tx: std::sync::mpsc::Sender<AppEvent>,
     rx: std::sync::mpsc::Receiver<AppEvent>,
     is_loading: bool,
@@ -98,6 +108,7 @@ enum HeapViewMode {
     Metrics,     // high-level view
     Allocations, // table view
     Chart,       // Chart
+    Histogram,   // allocation size distribution
 }
 enum InputMode {
     Normal,
@@ -154,6 +165,7 @@ impl App {
             alloc_table_page_size: 0,
             alloc_table_selected: 0,
             heap_view_mode: HeapViewMode::Metrics,
+            histogram_selected: 0,
             tx,
             rx,
             is_loading: false,
@@ -542,6 +554,36 @@ impl App {
                 .fg(self.theme.growth_warning)
                 .add_modifier(Modifier::BOLD),
         ))
+    }
+    fn histogram_select_next(&mut self) {
+        if self.histogram_selected + 1 < SIZE_BUCKETS.len() {
+            self.histogram_selected += 1;
+        }
+    }
+
+    fn histogram_select_prev(&mut self) {
+        self.histogram_selected = self.histogram_selected.saturating_sub(1);
+    }
+
+    /// Jump the Allocations table to the page containing the first (largest)
+    /// block that falls in the currently selected histogram bucket, then
+    /// switch views to show it.
+    fn jump_to_histogram_bucket(&mut self) {
+        let Some(snap) = self.heap_history.last() else {
+            return;
+        };
+        let (_, lo, hi) = SIZE_BUCKETS[self.histogram_selected];
+
+        let mut used_blocks: Vec<_> = snap.blocks.iter().filter(|b| !b.is_free).collect();
+        used_blocks.sort_by(|a, b| b.size.cmp(&a.size)); // same order as render_alloc_table
+
+        if let Some(idx) = used_blocks.iter().position(|b| b.size > lo && b.size <= hi)
+            && self.alloc_table_page_size > 0
+        {
+            self.alloc_table_page = idx / self.alloc_table_page_size;
+            self.alloc_table_selected = idx % self.alloc_table_page_size;
+            self.heap_view_mode = HeapViewMode::Allocations;
+        }
     }
 
     fn handle_command(&mut self, parts: Vec<&str>) {
@@ -1127,7 +1169,8 @@ impl App {
                             self.heap_view_mode = match self.heap_view_mode {
                                 HeapViewMode::Metrics => HeapViewMode::Allocations,
                                 HeapViewMode::Allocations => HeapViewMode::Chart,
-                                HeapViewMode::Chart => HeapViewMode::Metrics,
+                                HeapViewMode::Chart => HeapViewMode::Histogram,
+                                HeapViewMode::Histogram => HeapViewMode::Metrics,
                             };
                         }
                         KeyCode::Char('p') => self.set_focus(Focus::ProcList),
@@ -1139,12 +1182,18 @@ impl App {
                         KeyCode::Char('j') => match self.focus {
                             Focus::Tree => self.tree_select_next(),
                             Focus::ProcList => self.proc_list_select_next(),
-                            Focus::AllocTable => self.select_next_row(),
+                            Focus::AllocTable => match self.heap_view_mode {
+                                HeapViewMode::Histogram => self.histogram_select_next(),
+                                _ => self.select_next_row(),
+                            },
                         },
                         KeyCode::Char('k') => match self.focus {
                             Focus::Tree => self.tree_select_prev(),
                             Focus::ProcList => self.proc_list_select_prev(),
-                            Focus::AllocTable => self.select_prev_row(),
+                            Focus::AllocTable => match self.heap_view_mode {
+                                HeapViewMode::Histogram => self.histogram_select_prev(),
+                                _ => self.select_prev_row(),
+                            },
                         },
                         KeyCode::Enter => match self.focus {
                             Focus::Tree => self.tree_toggle_collapse(),
@@ -1153,7 +1202,11 @@ impl App {
                                     self.dispatch(&format!("scan {} -h", name));
                                 }
                             }
-                            Focus::AllocTable => {}
+                            Focus::AllocTable => {
+                                if matches!(self.heap_view_mode, HeapViewMode::Histogram) {
+                                    self.jump_to_histogram_bucket();
+                                }
+                            }
                         },
                         KeyCode::Char('a') if self.focus == Focus::ProcList => {
                             if let Some(name) = self.selected_proc_name() {
@@ -1471,7 +1524,7 @@ impl App {
                     .block(
                         Block::bordered()
                             .border_style(Style::default().fg(self.theme.border))
-                            .title("Leak Delta [Tab for metrics]")
+                            .title("Leak Delta [Tab for histogram]")
                             .fg(self.theme.healthy),
                     ),
                     heap_area,
@@ -1565,6 +1618,9 @@ impl App {
                             self.alloc_table_selected,
                             &self.theme,
                         ),
+                        HeapViewMode::Histogram => {
+                            render_histogram(snap, w, self.histogram_selected, &self.theme)
+                        }
                         HeapViewMode::Chart => unreachable!(),
                     }
                 }
@@ -1576,7 +1632,10 @@ impl App {
                         .border_style(Style::default().fg(self.theme.border))
                         .title(match self.heap_view_mode {
                             HeapViewMode::Metrics => "Heap View [Tab for table]",
-                            HeapViewMode::Allocations => "Heap View [Tab for metrics]",
+                            HeapViewMode::Allocations => "Heap View [Tab for chart]",
+                            HeapViewMode::Histogram => {
+                                "Allocation Histogram [Tab: metrics · Enter: jump]"
+                            }
                             HeapViewMode::Chart => unreachable!(),
                         })
                         .fg(self.theme.healthy),
@@ -1988,6 +2047,95 @@ fn render_process_tree(
         ),
         Span::raw(" back to list"),
     ]));
+
+    lines
+}
+
+fn render_histogram(
+    snap: &HeapSnapshot,
+    width: usize,
+    selected: usize,
+    theme: &crate::ui::theme::Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![];
+
+    let used_blocks: Vec<_> = snap.blocks.iter().filter(|b| !b.is_free).collect();
+    let total = used_blocks.len();
+
+    let mut counts = [0usize; SIZE_BUCKETS.len()];
+    let mut bytes = [0u64; SIZE_BUCKETS.len()];
+    for block in &used_blocks {
+        for (i, &(_, lo, hi)) in SIZE_BUCKETS.iter().enumerate() {
+            if block.size > lo && block.size <= hi {
+                counts[i] += 1;
+                bytes[i] += block.size as u64;
+                break;
+            }
+        }
+    }
+
+    let max_count = counts.iter().copied().max().unwrap_or(0).max(1);
+    let label_w = SIZE_BUCKETS
+        .iter()
+        .map(|(l, _, _)| l.len())
+        .max()
+        .unwrap_or(0);
+    let count_w = 6;
+    let bar_w = width.saturating_sub(label_w + count_w + 4).max(4);
+
+    lines.push(Line::raw(format!(
+        "── Allocation Size Distribution  ({total} used blocks) ──"
+    )));
+    lines.push(Line::raw(""));
+
+    for (i, &(label, _, _)) in SIZE_BUCKETS.iter().enumerate() {
+        let count = counts[i];
+        let fill = (((count as f64 / max_count as f64) * bar_w as f64).round() as usize).min(bar_w);
+
+        // colour ramp mirrors the LARGE/medium thresholds from render_alloc_table
+        let color = if i >= 4 {
+            theme.growth_critical
+        } else if i >= 2 {
+            theme.growth_warning
+        } else {
+            theme.healthy
+        };
+
+        let bar_style = if i == selected {
+            Style::default()
+                .bg(theme.highlight_bg)
+                .fg(theme.highlight_fg)
+        } else {
+            Style::default().fg(color)
+        };
+        let label_style = if i == selected {
+            Style::default().bg(theme.border).fg(theme.text)
+        } else {
+            Style::default().fg(theme.text)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label:<label_w$} "), label_style),
+            Span::styled("█".repeat(fill), bar_style),
+            Span::styled("░".repeat(bar_w - fill), Style::default().fg(theme.border)),
+            Span::styled(format!(" {count:>count_w$}"), label_style),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    if let Some(&(label, _, _)) = SIZE_BUCKETS.get(selected) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Selected: {label}  —  {} blocks, {} total",
+                counts[selected],
+                format_bytes(bytes[selected])
+            ),
+            Style::default().fg(theme.cyan),
+        )));
+    }
+    lines.push(Line::raw(
+        "j/k select bucket   Enter → jump to allocations   Tab → metrics",
+    ));
 
     lines
 }
