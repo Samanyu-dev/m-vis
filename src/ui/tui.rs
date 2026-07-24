@@ -28,6 +28,72 @@ const SIZE_BUCKETS: [(&str, usize, usize); 6] = [
     (">1MB", 1024 * 1024, usize::MAX),
 ];
 
+const HEAP_VIEW_ORDER: [HeapViewMode; 4] = [
+    HeapViewMode::Metrics,
+    HeapViewMode::Allocations,
+    HeapViewMode::Chart,
+    HeapViewMode::Histogram,
+];
+const SETTINGS_ROW_COUNT: usize = 10;
+
+fn heap_view_index(mode: HeapViewMode) -> usize {
+    HEAP_VIEW_ORDER.iter().position(|&m| m == mode).unwrap_or(0)
+}
+
+fn heap_view_label(mode: HeapViewMode) -> &'static str {
+    match mode {
+        HeapViewMode::Metrics => "Metrics",
+        HeapViewMode::Allocations => "Allocations",
+        HeapViewMode::Chart => "Chart",
+        HeapViewMode::Histogram => "Histogram",
+    }
+}
+
+struct Settings {
+    watch_interval_millis: u64,
+    theme_kind: ThemeKind,
+    badge_caution_mb_s: f64,
+    badge_warning_mb_s: f64,
+    badge_critical_mb_s: f64,
+    enabled_views: [bool; 4], // indexed via heap_view_index
+    default_view_idx: usize,
+}
+
+impl Settings {
+    fn new(theme_kind: ThemeKind) -> Self {
+        Self {
+            watch_interval_millis: 50,
+            theme_kind,
+            badge_caution_mb_s: 2.0,
+            badge_warning_mb_s: 20.0,
+            badge_critical_mb_s: 100.0,
+            enabled_views: [true; 4],
+            default_view_idx: 0,
+        }
+    }
+
+    fn is_enabled(&self, mode: HeapViewMode) -> bool {
+        self.enabled_views[heap_view_index(mode)]
+    }
+
+    fn default_view(&self) -> HeapViewMode {
+        HEAP_VIEW_ORDER[self.default_view_idx]
+    }
+
+    /// Next enabled view after `current`, wrapping; falls back to `current`
+    /// if somehow nothing else is enabled.
+    fn next_enabled_view(&self, current: HeapViewMode) -> HeapViewMode {
+        let start = heap_view_index(current);
+        for step in 1..=HEAP_VIEW_ORDER.len() {
+            let idx = (start + step) % HEAP_VIEW_ORDER.len();
+            if self.enabled_views[idx] {
+                return HEAP_VIEW_ORDER[idx];
+            }
+        }
+        current
+    }
+}
+
 enum AppEvent {
     DiffResult(Vec<HeapBlock>, ScanResult),
     BaseLine(ScanResult),
@@ -42,7 +108,7 @@ enum AppEvent {
 pub fn tui_main(theme_kind: ThemeKind) -> Result<()> {
     color_eyre::install()?;
     let terminal = ratatui::init(); // replaces ratatui::run
-    let result = App::new(theme_kind.theme()).run(terminal);
+    let result = App::new(theme_kind).run(terminal);
     ratatui::restore();
     result
 }
@@ -103,7 +169,11 @@ struct App {
     watch_target: Option<String>,
     watch_mode: Option<String>,
     swap_panels: bool,
+    settings: Settings,
+    settings_open: bool,
+    settings_selected: usize,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum HeapViewMode {
     Metrics,     // high-level view
     Allocations, // table view
@@ -147,8 +217,11 @@ struct PromptState {
 //}
 
 impl App {
-    fn new(theme: Theme) -> Self {
+    fn new(theme_kind: ThemeKind) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
+        let theme = theme_kind.theme();
+        let settings = Settings::new(theme_kind);
+        let _default_view = settings.default_view();
         let mut app = Self {
             input: String::new(),
             input_mode: InputMode::Normal,
@@ -187,6 +260,9 @@ impl App {
             watch_target: None,
             watch_mode: None,
             swap_panels: false,
+            settings,
+            settings_open: false,
+            settings_selected: 0,
         };
         app.push_message("mvis ready. type 'help' for commands.".into());
         app
@@ -316,21 +392,21 @@ impl App {
         let net_mb = net as f64 / (1024.0 * 1024.0);
         // Average per-sample MB rate (spanning count-1 intervals of ~2s each)
         let per_sample_rate = net_mb;
-        if per_sample_rate > 100.0 {
+        if per_sample_rate > self.settings.badge_critical_mb_s {
             Some((
                 "◆ CRITICAL".into(),
                 Style::default()
                     .fg(self.theme.growth_critical)
                     .add_modifier(Modifier::BOLD | Modifier::RAPID_BLINK),
             ))
-        } else if per_sample_rate > 20.0 {
+        } else if per_sample_rate > self.settings.badge_warning_mb_s {
             Some((
                 "▲ WARNING".into(),
                 Style::default()
                     .fg(self.theme.growth_critical)
                     .add_modifier(Modifier::BOLD),
             ))
-        } else if per_sample_rate > 2.0 {
+        } else if per_sample_rate > self.settings.badge_caution_mb_s {
             Some((
                 "△ CAUTION".into(),
                 Style::default()
@@ -586,6 +662,82 @@ impl App {
         }
     }
 
+    fn settings_select_next(&mut self) {
+        self.settings_selected = (self.settings_selected + 1) % SETTINGS_ROW_COUNT;
+    }
+
+    fn settings_select_prev(&mut self) {
+        self.settings_selected =
+            (self.settings_selected + SETTINGS_ROW_COUNT - 1) % SETTINGS_ROW_COUNT;
+    }
+
+    fn settings_adjust(&mut self, dir: i32) {
+        match self.settings_selected {
+            0 => {
+                let v = self.settings.watch_interval_millis as i64 + dir as i64;
+                self.settings.watch_interval_millis = v.max(1) as u64;
+            }
+            1 => {
+                self.settings.theme_kind = if dir > 0 {
+                    self.settings.theme_kind.next()
+                } else {
+                    self.settings.theme_kind.prev()
+                };
+                self.theme = self.settings.theme_kind.theme();
+            }
+            2 => {
+                self.settings.badge_caution_mb_s =
+                    (self.settings.badge_caution_mb_s + dir as f64).max(0.1)
+            }
+            3 => {
+                self.settings.badge_warning_mb_s =
+                    (self.settings.badge_warning_mb_s + dir as f64).max(0.1)
+            }
+            4 => {
+                self.settings.badge_critical_mb_s =
+                    (self.settings.badge_critical_mb_s + dir as f64).max(0.1)
+            }
+            5..=8 => self.settings_toggle_view(self.settings_selected - 5),
+            9 => {
+                let len = HEAP_VIEW_ORDER.len();
+                let mut idx = self.settings.default_view_idx;
+                for _ in 0..len {
+                    idx = ((idx as i64 + dir as i64).rem_euclid(len as i64)) as usize;
+                    if self.settings.enabled_views[idx] {
+                        self.settings.default_view_idx = idx;
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn settings_activate(&mut self) {
+        if (5..=8).contains(&self.settings_selected) {
+            self.settings_toggle_view(self.settings_selected - 5);
+        } else {
+            self.settings_adjust(1);
+        }
+    }
+
+    fn settings_toggle_view(&mut self, idx: usize) {
+        let enabled_count = self.settings.enabled_views.iter().filter(|&&e| e).count();
+        if self.settings.enabled_views[idx] && enabled_count <= 1 {
+            return; // never allow disabling the last remaining view
+        }
+        self.settings.enabled_views[idx] = !self.settings.enabled_views[idx];
+
+        if !self.settings.enabled_views[self.settings.default_view_idx]
+            && let Some(next) = (0..HEAP_VIEW_ORDER.len()).find(|&i| self.settings.enabled_views[i])
+        {
+            self.settings.default_view_idx = next;
+        }
+        if !self.settings.is_enabled(self.heap_view_mode) {
+            self.heap_view_mode = self.settings.next_enabled_view(self.heap_view_mode);
+        }
+    }
+
     fn handle_command(&mut self, parts: Vec<&str>) {
         match parts.clone().as_slice() {
             ["baseline", _proc] => {
@@ -714,6 +866,8 @@ impl App {
                 let tx = self.tx.clone();
                 let busy = self.busy.clone();
 
+                let interval = self.settings.watch_interval_millis.max(100);
+
                 // build the command string to dispatch
                 let cmd = match mode.as_str() {
                     "-h" => format!("scan {} -h", proc),
@@ -756,7 +910,7 @@ impl App {
                             if stop.load(Ordering::Relaxed) {
                                 break;
                             }
-                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            std::thread::sleep(std::time::Duration::from_millis(interval));
                             waited_ms += 50;
 
                             // safety timeout — don't hang forever if something never completes
@@ -915,6 +1069,7 @@ impl App {
                 self.push_message("  list                      list processes".into());
                 self.push_message("  clear                     clear output history".into());
                 self.push_message("  [t key]                   toggle process tree view".into());
+                self.push_message("  [S key]                   open settings panel".into());
                 self.push_message(
                     "  [x key]                   swap output/heap view panels".into(),
                 );
@@ -1154,6 +1309,21 @@ impl App {
                 continue; // skip normal-mode key handling this iteration
             }
 
+            if self.settings_open {
+                if let Some(key) = event::read()?.as_key_press_event() {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('S') => self.settings_open = false,
+                        KeyCode::Char('j') | KeyCode::Down => self.settings_select_next(),
+                        KeyCode::Char('k') | KeyCode::Up => self.settings_select_prev(),
+                        KeyCode::Char('h') | KeyCode::Left => self.settings_adjust(-1),
+                        KeyCode::Char('l') | KeyCode::Right => self.settings_adjust(1),
+                        KeyCode::Enter => self.settings_activate(),
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+
             if crossterm::event::poll(std::time::Duration::from_millis(100))?
                 && let Some(key) = event::read()?.as_key_press_event()
             {
@@ -1162,16 +1332,13 @@ impl App {
                         KeyCode::Char('e') => self.input_mode = InputMode::Editing,
                         KeyCode::Char('q') => return Ok(()),
                         KeyCode::Char('t') => self.set_focus(Focus::Tree),
+                        KeyCode::Char('S') => self.settings_open = !self.settings_open,
                         KeyCode::Char('x') => self.swap_panels = !self.swap_panels,
                         KeyCode::Up => self.scroll_up(),
                         KeyCode::Down => self.scroll_down(),
                         KeyCode::Tab => {
-                            self.heap_view_mode = match self.heap_view_mode {
-                                HeapViewMode::Metrics => HeapViewMode::Allocations,
-                                HeapViewMode::Allocations => HeapViewMode::Chart,
-                                HeapViewMode::Chart => HeapViewMode::Histogram,
-                                HeapViewMode::Histogram => HeapViewMode::Metrics,
-                            };
+                            self.heap_view_mode =
+                                self.settings.next_enabled_view(self.heap_view_mode);
                         }
                         KeyCode::Char('p') => self.set_focus(Focus::ProcList),
                         KeyCode::Char('r') if self.focus == Focus::ProcList => {
@@ -1734,6 +1901,7 @@ impl App {
                 }
                 spans.extend(hint("t/p", "toggle tree/proclist"));
                 spans.extend(hint("x", "swap output/heap panels"));
+                spans.extend(hint("S", "settings"));
                 Line::from(spans)
             }
             InputMode::Editing => Line::from(vec![
@@ -1770,6 +1938,97 @@ impl App {
                 .wrap(Wrap { trim: true }),
             footer,
         );
+
+        if self.settings_open {
+            let area = frame.area();
+            let w = 56.min(area.width.saturating_sub(4));
+            let h = (SETTINGS_ROW_COUNT as u16 + 5).min(area.height.saturating_sub(4));
+            let x = (area.width.saturating_sub(w)) / 2;
+            let y = (area.height.saturating_sub(h)) / 2;
+            let popup = ratatui::layout::Rect::new(x, y, w, h);
+            frame.render_widget(ratatui::widgets::Clear, popup);
+
+            let row_style = |i: usize, theme: &Theme| {
+                if i == self.settings_selected {
+                    Style::default()
+                        .bg(theme.highlight_bg)
+                        .fg(theme.highlight_fg)
+                } else {
+                    Style::default().fg(theme.text)
+                }
+            };
+
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    format!(
+                        "{:<22} {}",
+                        "Watch interval (ms)", self.settings.watch_interval_millis
+                    ),
+                    row_style(0, &self.theme),
+                )),
+                Line::from(Span::styled(
+                    format!("{:<22} {:?}", "Theme", self.settings.theme_kind),
+                    row_style(1, &self.theme),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "{:<22} {:.1}",
+                        "Badge: Caution MB/s", self.settings.badge_caution_mb_s
+                    ),
+                    row_style(2, &self.theme),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "{:<22} {:.1}",
+                        "Badge: Warning MB/s", self.settings.badge_warning_mb_s
+                    ),
+                    row_style(3, &self.theme),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "{:<22} {:.1}",
+                        "Badge: Critical MB/s", self.settings.badge_critical_mb_s
+                    ),
+                    row_style(4, &self.theme),
+                )),
+            ];
+            for (i, mode) in HEAP_VIEW_ORDER.iter().enumerate() {
+                let mark = if self.settings.enabled_views[i] {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{:<22} {}",
+                        format!("View: {}", heap_view_label(*mode)),
+                        mark
+                    ),
+                    row_style(5 + i, &self.theme),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{:<22} {}",
+                    "Default view",
+                    heap_view_label(self.settings.default_view())
+                ),
+                row_style(9, &self.theme),
+            )));
+            lines.push(Line::raw(""));
+            lines.push(Line::raw("j/k select  h/l adjust  Enter toggle  Esc close"));
+
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(
+                        Block::bordered()
+                            .border_style(Style::default().fg(self.theme.growth_warning))
+                            .title("Settings"),
+                    )
+                    .style(Style::default().bg(self.theme.bg).fg(self.theme.text)),
+                popup,
+            );
+        }
     }
 }
 
@@ -2147,7 +2406,7 @@ mod tests {
     // ── helpers ─────────────────────────────────────────────────────────────
 
     fn make_app() -> App {
-        App::new(ThemeKind::default().theme())
+        App::new(ThemeKind::default())
     }
 
     fn make_app_with_heap() -> App {
@@ -2188,7 +2447,7 @@ mod tests {
 
     #[test]
     fn clear_command_removes_output_and_resets_scroll() {
-        let mut app = App::new(ThemeKind::default().theme());
+        let mut app = App::new(ThemeKind::default());
         app.messages_height = 1;
         app.push_message("old output".into());
         app.scroll_down();
@@ -2203,7 +2462,7 @@ mod tests {
 
     #[test]
     fn help_mentions_clear_command() {
-        let mut app = App::new(ThemeKind::default().theme());
+        let mut app = App::new(ThemeKind::default());
 
         app.input = "help".into();
         app.character_index = app.input.chars().count();

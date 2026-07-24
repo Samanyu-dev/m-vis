@@ -10,6 +10,26 @@ pub enum ThemeKind {
 }
 
 impl ThemeKind {
+    /// Cycles forward through themes in a fixed, predictable order.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Deuteranopia,
+            Self::Deuteranopia => Self::Protanopia,
+            Self::Protanopia => Self::Dark,
+        }
+    }
+
+    /// Cycles backward through themes.
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Dark => Self::Protanopia,
+            Self::Light => Self::Dark,
+            Self::Deuteranopia => Self::Light,
+            Self::Protanopia => Self::Deuteranopia,
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "dark" => Some(Self::Dark),
