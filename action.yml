@@ -75,7 +75,7 @@ runs:
             | grep '"tag_name"' | cut -d '"' -f 4)
         fi
         mkdir -p "$RUNNER_TEMP/mvis-bin"
-        curl -sSL \
+        curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
           "https://github.com/SickleFire/m-vis/releases/download/${VERSION}/mvis-linux-x86_64" \
           -o "$RUNNER_TEMP/mvis-bin/mvis"
         chmod +x "$RUNNER_TEMP/mvis-bin/mvis"
@@ -114,7 +114,7 @@ runs:
           ASSET="mvis-macos-x86_64"
         fi
         mkdir -p "$RUNNER_TEMP/mvis-bin"
-        curl -sSL \
+        curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
           "https://github.com/SickleFire/m-vis/releases/download/${VERSION}/${ASSET}" \
           -o "$RUNNER_TEMP/mvis-bin/mvis"
         chmod +x "$RUNNER_TEMP/mvis-bin/mvis"
