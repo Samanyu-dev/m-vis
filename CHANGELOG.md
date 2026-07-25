@@ -1,4 +1,20 @@
 # Changelog
+## [0.5.0-rc2] - 2026-07-25
+### Added
+- added CI/CD commands: `--warmup` `--growth-rate` `--sample-interval` `--diff-only`
+- added diff file support and save to TUI/CLI
+- added **allocation histogram**
+- QOL added **settings menu**
+- QOL made **heap/output swappable**
+
+### Fixed
+- Fix macOS smoke test timeout by using sudo
+- implement walk_heap_granular for linux
+- Fix #86: Add configurable iteration limits to walk_regions
+- Improved Junit export with refactors
+- made process list and tree scrollable
+- fix: fail loudly on binary download errors in smoke-test action
+
 ## [0.5.0-rc1] - 2026-07-6
 ### Added
 - **CI/CD Mode**: Full programmatic integration layer with JSON/CSV export, differential leak detection (`--diff-only`), configurable sampling, and growth rate monitoring.
