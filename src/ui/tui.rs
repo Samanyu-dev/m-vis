@@ -14,9 +14,85 @@ use crate::types::{HeapBlock, RegionProtect};
 use crate::ui::commands::ScanResult;
 use crate::ui::theme::{Theme, ThemeKind};
 use crate::utils::formatting::{format_bytes, format_bytes_i64};
+use crate::utils::loader::load_heap_snapshot;
 use crate::utils::process::{TreeDisplayRow, build_process_tree, flatten_tree};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+
+const SIZE_BUCKETS: [(&str, usize, usize); 6] = [
+    ("0-64B", 0, 64),
+    ("65-512B", 64, 512),
+    ("513B-4KB", 512, 4 * 1024),
+    ("4-64KB", 4 * 1024, 64 * 1024),
+    ("64KB-1MB", 64 * 1024, 1024 * 1024),
+    (">1MB", 1024 * 1024, usize::MAX),
+];
+
+const HEAP_VIEW_ORDER: [HeapViewMode; 4] = [
+    HeapViewMode::Metrics,
+    HeapViewMode::Allocations,
+    HeapViewMode::Chart,
+    HeapViewMode::Histogram,
+];
+const SETTINGS_ROW_COUNT: usize = 10;
+
+fn heap_view_index(mode: HeapViewMode) -> usize {
+    HEAP_VIEW_ORDER.iter().position(|&m| m == mode).unwrap_or(0)
+}
+
+fn heap_view_label(mode: HeapViewMode) -> &'static str {
+    match mode {
+        HeapViewMode::Metrics => "Metrics",
+        HeapViewMode::Allocations => "Allocations",
+        HeapViewMode::Chart => "Chart",
+        HeapViewMode::Histogram => "Histogram",
+    }
+}
+
+struct Settings {
+    watch_interval_millis: u64,
+    theme_kind: ThemeKind,
+    badge_caution_mb_s: f64,
+    badge_warning_mb_s: f64,
+    badge_critical_mb_s: f64,
+    enabled_views: [bool; 4], // indexed via heap_view_index
+    default_view_idx: usize,
+}
+
+impl Settings {
+    fn new(theme_kind: ThemeKind) -> Self {
+        Self {
+            watch_interval_millis: 50,
+            theme_kind,
+            badge_caution_mb_s: 2.0,
+            badge_warning_mb_s: 20.0,
+            badge_critical_mb_s: 100.0,
+            enabled_views: [true; 4],
+            default_view_idx: 0,
+        }
+    }
+
+    fn is_enabled(&self, mode: HeapViewMode) -> bool {
+        self.enabled_views[heap_view_index(mode)]
+    }
+
+    fn default_view(&self) -> HeapViewMode {
+        HEAP_VIEW_ORDER[self.default_view_idx]
+    }
+
+    /// Next enabled view after `current`, wrapping; falls back to `current`
+    /// if somehow nothing else is enabled.
+    fn next_enabled_view(&self, current: HeapViewMode) -> HeapViewMode {
+        let start = heap_view_index(current);
+        for step in 1..=HEAP_VIEW_ORDER.len() {
+            let idx = (start + step) % HEAP_VIEW_ORDER.len();
+            if self.enabled_views[idx] {
+                return HEAP_VIEW_ORDER[idx];
+            }
+        }
+        current
+    }
+}
 
 enum AppEvent {
     DiffResult(Vec<HeapBlock>, ScanResult),
@@ -32,7 +108,7 @@ enum AppEvent {
 pub fn tui_main(theme_kind: ThemeKind) -> Result<()> {
     color_eyre::install()?;
     let terminal = ratatui::init(); // replaces ratatui::run
-    let result = App::new(theme_kind.theme()).run(terminal);
+    let result = App::new(theme_kind).run(terminal);
     ratatui::restore();
     result
 }
@@ -71,6 +147,7 @@ struct App {
     alloc_table_page_size: usize, // rows per page, derived from panel height
     alloc_table_selected: usize,  // highlighted row
     heap_view_mode: HeapViewMode,
+    histogram_selected: usize,
     tx: std::sync::mpsc::Sender<AppEvent>,
     rx: std::sync::mpsc::Receiver<AppEvent>,
     is_loading: bool,
@@ -79,20 +156,58 @@ struct App {
     busy: std::sync::Arc<AtomicBool>,
     leak_deltas: Vec<LeakDelta>,
     theme: Theme,
-    show_tree_view: bool,
     tree_rows: Vec<TreeDisplayRow>,
     tree_selected: usize,
+    tree_scroll: usize,
     tree_collapsed: std::collections::HashSet<u32>,
     tree_total_memory: u64,
+    proc_list: Vec<String>,
+    proc_list_selected: usize,
+    proc_list_scroll: usize,
+    focus: Focus,
+    prompt: Option<PromptState>,
+    watch_target: Option<String>,
+    watch_mode: Option<String>,
+    swap_panels: bool,
+    settings: Settings,
+    settings_open: bool,
+    settings_selected: usize,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum HeapViewMode {
     Metrics,     // high-level view
     Allocations, // table view
     Chart,       // Chart
+    Histogram,   // allocation size distribution
 }
 enum InputMode {
     Normal,
     Editing,
+}
+
+#[derive(PartialEq, Debug)]
+enum Focus {
+    ProcList,
+    Tree,
+    AllocTable,
+}
+
+struct PromptField {
+    label: &'static str,
+    value: String,
+}
+
+enum PromptKind {
+    Leak,  // secs
+    LeakM, // secs, samples
+    Watch, // mode: -h/-m/-l
+}
+
+struct PromptState {
+    kind: PromptKind,
+    proc_name: String,
+    fields: Vec<PromptField>,
+    selected: usize,
 }
 
 //macro_rules! run_command {
@@ -102,8 +217,11 @@ enum InputMode {
 //}
 
 impl App {
-    fn new(theme: Theme) -> Self {
+    fn new(theme_kind: ThemeKind) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
+        let theme = theme_kind.theme();
+        let settings = Settings::new(theme_kind);
+        let _default_view = settings.default_view();
         let mut app = Self {
             input: String::new(),
             input_mode: InputMode::Normal,
@@ -120,6 +238,7 @@ impl App {
             alloc_table_page_size: 0,
             alloc_table_selected: 0,
             heap_view_mode: HeapViewMode::Metrics,
+            histogram_selected: 0,
             tx,
             rx,
             is_loading: false,
@@ -128,14 +247,98 @@ impl App {
             busy: std::sync::Arc::new(AtomicBool::new(false)),
             leak_deltas: vec![],
             theme,
-            show_tree_view: false,
             tree_rows: vec![],
             tree_selected: 0,
+            tree_scroll: 0,
             tree_collapsed: std::collections::HashSet::new(),
             tree_total_memory: 0,
+            proc_list: vec![],
+            proc_list_selected: 0,
+            proc_list_scroll: 0,
+            focus: Focus::AllocTable,
+            prompt: None,
+            watch_target: None,
+            watch_mode: None,
+            swap_panels: false,
+            settings,
+            settings_open: false,
+            settings_selected: 0,
         };
         app.push_message("mvis ready. type 'help' for commands.".into());
         app
+    }
+
+    fn open_prompt(&mut self, kind: PromptKind) {
+        if let Some(name) = self.selected_proc_name() {
+            let fields = match kind {
+                PromptKind::Leak => vec![PromptField {
+                    label: "secs",
+                    value: String::new(),
+                }],
+                PromptKind::LeakM => vec![
+                    PromptField {
+                        label: "secs",
+                        value: String::new(),
+                    },
+                    PromptField {
+                        label: "samples",
+                        value: String::new(),
+                    },
+                ],
+                PromptKind::Watch => vec![PromptField {
+                    label: "mode (-h/-m/-l)",
+                    value: "-l".into(),
+                }],
+            };
+            self.prompt = Some(PromptState {
+                kind,
+                proc_name: name,
+                fields,
+                selected: 0,
+            });
+        }
+    }
+
+    fn prompt_confirm(&mut self) {
+        if let Some(p) = self.prompt.take() {
+            let cmd = match p.kind {
+                PromptKind::Leak => format!("leak {} {}", p.proc_name, p.fields[0].value),
+                PromptKind::LeakM => format!(
+                    "leak-m {} {} {}",
+                    p.proc_name, p.fields[0].value, p.fields[1].value
+                ),
+                PromptKind::Watch => format!("watch {} {}", p.proc_name, p.fields[0].value),
+            };
+            self.dispatch(&cmd);
+        }
+    }
+
+    fn prompt_cancel(&mut self) {
+        self.prompt = None;
+    }
+
+    fn prompt_next_field(&mut self) {
+        if let Some(p) = &mut self.prompt {
+            p.selected = (p.selected + 1) % p.fields.len();
+        }
+    }
+
+    fn prompt_prev_field(&mut self) {
+        if let Some(p) = &mut self.prompt {
+            p.selected = (p.selected + p.fields.len() - 1) % p.fields.len();
+        }
+    }
+
+    fn prompt_push_char(&mut self, c: char) {
+        if let Some(p) = &mut self.prompt {
+            p.fields[p.selected].value.push(c);
+        }
+    }
+
+    fn prompt_backspace(&mut self) {
+        if let Some(p) = &mut self.prompt {
+            p.fields[p.selected].value.pop();
+        }
     }
 
     fn scroll_up(&mut self) {
@@ -189,21 +392,21 @@ impl App {
         let net_mb = net as f64 / (1024.0 * 1024.0);
         // Average per-sample MB rate (spanning count-1 intervals of ~2s each)
         let per_sample_rate = net_mb;
-        if per_sample_rate > 100.0 {
+        if per_sample_rate > self.settings.badge_critical_mb_s {
             Some((
                 "◆ CRITICAL".into(),
                 Style::default()
                     .fg(self.theme.growth_critical)
                     .add_modifier(Modifier::BOLD | Modifier::RAPID_BLINK),
             ))
-        } else if per_sample_rate > 20.0 {
+        } else if per_sample_rate > self.settings.badge_warning_mb_s {
             Some((
                 "▲ WARNING".into(),
                 Style::default()
                     .fg(self.theme.growth_critical)
                     .add_modifier(Modifier::BOLD),
             ))
-        } else if per_sample_rate > 2.0 {
+        } else if per_sample_rate > self.settings.badge_caution_mb_s {
             Some((
                 "△ CAUTION".into(),
                 Style::default()
@@ -305,10 +508,49 @@ impl App {
         self.alloc_table_selected = self.alloc_table_selected.saturating_sub(1);
     }
 
-    fn toggle_tree_view(&mut self) {
-        self.show_tree_view = !self.show_tree_view;
-        if self.show_tree_view {
-            self.refresh_tree();
+    fn refresh_proc_list(&mut self) {
+        let args = vec![""];
+        match commands::list_processes(args) {
+            Ok(procs) => {
+                self.proc_list = procs;
+                if self.proc_list_selected >= self.proc_list.len() {
+                    self.proc_list_selected = self.proc_list.len().saturating_sub(1);
+                }
+                self.proc_list_scroll = self.proc_list_scroll.min(self.proc_list_selected);
+            }
+            Err(e) => self.push_message(format!("Error: {e}")),
+        }
+    }
+
+    fn proc_list_select_next(&mut self) {
+        if self.proc_list_selected + 1 < self.proc_list.len() {
+            self.proc_list_selected += 1;
+        }
+    }
+
+    fn proc_list_select_prev(&mut self) {
+        self.proc_list_selected = self.proc_list_selected.saturating_sub(1);
+    }
+
+    fn selected_proc_name(&self) -> Option<String> {
+        self.proc_list
+            .get(self.proc_list_selected)
+            .and_then(|row| row.split_whitespace().nth(1))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    fn set_focus(&mut self, target: Focus) {
+        // pressing the same key twice returns focus to the alloc table
+        self.focus = if self.focus == target {
+            Focus::AllocTable
+        } else {
+            target
+        };
+        match self.focus {
+            Focus::Tree => self.refresh_tree(),
+            Focus::ProcList => self.refresh_proc_list(),
+            Focus::AllocTable => {}
         }
     }
 
@@ -323,6 +565,7 @@ impl App {
             if self.tree_selected >= self.tree_rows.len() {
                 self.tree_selected = self.tree_rows.len().saturating_sub(1);
             }
+            self.tree_scroll = self.tree_scroll.min(self.tree_selected);
         }
     }
 
@@ -350,6 +593,12 @@ impl App {
         self.tree_selected = self.tree_selected.saturating_sub(1);
     }
 
+    fn insert_at_cursor(&mut self, text: &str) {
+        let index = self.byte_index();
+        self.input.insert_str(index, text);
+        self.character_index += text.chars().count();
+    }
+
     fn submit_message(&mut self) {
         let raw = self.input.trim().to_string();
         self.input.clear();
@@ -359,6 +608,7 @@ impl App {
         }
         self.dispatch(&raw);
     }
+
     fn dispatch(&mut self, cmd: &str) {
         let raw = cmd.trim().to_string();
         if raw.is_empty() {
@@ -370,6 +620,124 @@ impl App {
         let parts: Vec<&str> = raw.split_whitespace().collect();
         self.handle_command(parts);
     }
+
+    fn compute_watch_badge(&self) -> Option<(String, Style)> {
+        let target = self.watch_target.as_ref()?;
+        let mode = self.watch_mode.as_deref().unwrap_or("");
+        Some((
+            format!("● watching {} ({})", target, mode),
+            Style::default()
+                .fg(self.theme.growth_warning)
+                .add_modifier(Modifier::BOLD),
+        ))
+    }
+    fn histogram_select_next(&mut self) {
+        if self.histogram_selected + 1 < SIZE_BUCKETS.len() {
+            self.histogram_selected += 1;
+        }
+    }
+
+    fn histogram_select_prev(&mut self) {
+        self.histogram_selected = self.histogram_selected.saturating_sub(1);
+    }
+
+    /// Jump the Allocations table to the page containing the first (largest)
+    /// block that falls in the currently selected histogram bucket, then
+    /// switch views to show it.
+    fn jump_to_histogram_bucket(&mut self) {
+        let Some(snap) = self.heap_history.last() else {
+            return;
+        };
+        let (_, lo, hi) = SIZE_BUCKETS[self.histogram_selected];
+
+        let mut used_blocks: Vec<_> = snap.blocks.iter().filter(|b| !b.is_free).collect();
+        used_blocks.sort_by(|a, b| b.size.cmp(&a.size)); // same order as render_alloc_table
+
+        if let Some(idx) = used_blocks.iter().position(|b| b.size > lo && b.size <= hi)
+            && self.alloc_table_page_size > 0
+        {
+            self.alloc_table_page = idx / self.alloc_table_page_size;
+            self.alloc_table_selected = idx % self.alloc_table_page_size;
+            self.heap_view_mode = HeapViewMode::Allocations;
+        }
+    }
+
+    fn settings_select_next(&mut self) {
+        self.settings_selected = (self.settings_selected + 1) % SETTINGS_ROW_COUNT;
+    }
+
+    fn settings_select_prev(&mut self) {
+        self.settings_selected =
+            (self.settings_selected + SETTINGS_ROW_COUNT - 1) % SETTINGS_ROW_COUNT;
+    }
+
+    fn settings_adjust(&mut self, dir: i32) {
+        match self.settings_selected {
+            0 => {
+                let v = self.settings.watch_interval_millis as i64 + dir as i64;
+                self.settings.watch_interval_millis = v.max(1) as u64;
+            }
+            1 => {
+                self.settings.theme_kind = if dir > 0 {
+                    self.settings.theme_kind.next()
+                } else {
+                    self.settings.theme_kind.prev()
+                };
+                self.theme = self.settings.theme_kind.theme();
+            }
+            2 => {
+                self.settings.badge_caution_mb_s =
+                    (self.settings.badge_caution_mb_s + dir as f64).max(0.1)
+            }
+            3 => {
+                self.settings.badge_warning_mb_s =
+                    (self.settings.badge_warning_mb_s + dir as f64).max(0.1)
+            }
+            4 => {
+                self.settings.badge_critical_mb_s =
+                    (self.settings.badge_critical_mb_s + dir as f64).max(0.1)
+            }
+            5..=8 => self.settings_toggle_view(self.settings_selected - 5),
+            9 => {
+                let len = HEAP_VIEW_ORDER.len();
+                let mut idx = self.settings.default_view_idx;
+                for _ in 0..len {
+                    idx = ((idx as i64 + dir as i64).rem_euclid(len as i64)) as usize;
+                    if self.settings.enabled_views[idx] {
+                        self.settings.default_view_idx = idx;
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn settings_activate(&mut self) {
+        if (5..=8).contains(&self.settings_selected) {
+            self.settings_toggle_view(self.settings_selected - 5);
+        } else {
+            self.settings_adjust(1);
+        }
+    }
+
+    fn settings_toggle_view(&mut self, idx: usize) {
+        let enabled_count = self.settings.enabled_views.iter().filter(|&&e| e).count();
+        if self.settings.enabled_views[idx] && enabled_count <= 1 {
+            return; // never allow disabling the last remaining view
+        }
+        self.settings.enabled_views[idx] = !self.settings.enabled_views[idx];
+
+        if !self.settings.enabled_views[self.settings.default_view_idx]
+            && let Some(next) = (0..HEAP_VIEW_ORDER.len()).find(|&i| self.settings.enabled_views[i])
+        {
+            self.settings.default_view_idx = next;
+        }
+        if !self.settings.is_enabled(self.heap_view_mode) {
+            self.heap_view_mode = self.settings.next_enabled_view(self.heap_view_mode);
+        }
+    }
+
     fn handle_command(&mut self, parts: Vec<&str>) {
         match parts.clone().as_slice() {
             ["baseline", _proc] => {
@@ -421,6 +789,74 @@ impl App {
                     };
                 });
             }
+            ["diff", file_a, file_b] => {
+                let path_a = file_a.to_string();
+                let path_b = file_b.to_string();
+                let tx = self.tx.clone();
+
+                std::thread::spawn(move || {
+                    let result = (|| -> Result<(Vec<HeapBlock>, ScanResult), String> {
+                        let a = load_heap_snapshot(&path_a)
+                            .map_err(|e| format!("{}: {}", path_a, e))?;
+                        let b = load_heap_snapshot(&path_b)
+                            .map_err(|e| format!("{}: {}", path_b, e))?;
+                        Ok((a.blocks, b))
+                    })();
+
+                    match result {
+                        Ok((baseline_blocks, current)) => {
+                            tx.send(AppEvent::DiffResult(baseline_blocks, current)).ok();
+                        }
+                        Err(e) => {
+                            tx.send(AppEvent::Output(Line::raw(format!("error: {e}"))))
+                                .ok();
+                        }
+                    }
+                });
+            }
+            ["save", _proc, _file] => {
+                let query = "scan".to_string();
+                let proc = _proc.to_string();
+                let mode = "-h".to_string();
+                let path = _file.to_string();
+                let tx = self.tx.clone();
+
+                self.push_message(format!("scanning {} to save as {}...", proc, path));
+
+                std::thread::spawn(move || {
+                    let parts_ref: Vec<&str> = vec![&query, &proc, &mode];
+                    match commands::scan(parts_ref) {
+                        Ok(result) => match serde_json::to_string_pretty(&result) {
+                            Ok(json) => match std::fs::write(&path, json) {
+                                Ok(()) => {
+                                    tx.send(AppEvent::Output(Line::raw(format!(
+                                        "saved snapshot to {}",
+                                        path
+                                    ))))
+                                    .ok();
+                                }
+                                Err(e) => {
+                                    tx.send(AppEvent::Output(Line::raw(format!(
+                                        "failed to write {}: {}",
+                                        path, e
+                                    ))))
+                                    .ok();
+                                }
+                            },
+                            Err(e) => {
+                                tx.send(AppEvent::Output(Line::raw(format!(
+                                    "failed to serialize snapshot: {}",
+                                    e
+                                ))))
+                                .ok();
+                            }
+                        },
+                        Err(e) => {
+                            tx.send(AppEvent::Output(Line::raw(e.to_string()))).ok();
+                        }
+                    };
+                });
+            }
             ["clearbaseline"] => {
                 self.current_baseline = None;
             }
@@ -429,6 +865,8 @@ impl App {
                 let mode = _mode.to_string();
                 let tx = self.tx.clone();
                 let busy = self.busy.clone();
+
+                let interval = self.settings.watch_interval_millis.max(100);
 
                 // build the command string to dispatch
                 let cmd = match mode.as_str() {
@@ -447,6 +885,8 @@ impl App {
 
                 let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 self.watch_stop = Some(stop.clone());
+                self.watch_target = Some(proc.clone());
+                self.watch_mode = Some(mode.clone());
 
                 self.push_message(format!("watching: {}", cmd));
 
@@ -470,7 +910,7 @@ impl App {
                             if stop.load(Ordering::Relaxed) {
                                 break;
                             }
-                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            std::thread::sleep(std::time::Duration::from_millis(interval));
                             waited_ms += 50;
 
                             // safety timeout — don't hang forever if something never completes
@@ -505,6 +945,8 @@ impl App {
                 } else {
                     self.push_message("no watch running".into());
                 }
+                self.watch_target = None;
+                self.watch_mode = None;
             }
             ["leak-m", _proc, _secs, _samples] => {
                 let proc_name = _proc.to_string();
@@ -627,6 +1069,10 @@ impl App {
                 self.push_message("  list                      list processes".into());
                 self.push_message("  clear                     clear output history".into());
                 self.push_message("  [t key]                   toggle process tree view".into());
+                self.push_message("  [S key]                   open settings panel".into());
+                self.push_message(
+                    "  [x key]                   swap output/heap view panels".into(),
+                );
             }
             _ => {
                 self.push_message(format!("unknown command: {}", parts.join(" ")));
@@ -848,6 +1294,36 @@ impl App {
 
             terminal.draw(|frame| self.render(frame))?;
 
+            if self.prompt.is_some() {
+                if let Some(key) = event::read()?.as_key_press_event() {
+                    match key.code {
+                        KeyCode::Esc => self.prompt_cancel(),
+                        KeyCode::Enter => self.prompt_confirm(),
+                        KeyCode::Tab => self.prompt_next_field(),
+                        KeyCode::BackTab => self.prompt_prev_field(),
+                        KeyCode::Char(c) => self.prompt_push_char(c),
+                        KeyCode::Backspace => self.prompt_backspace(),
+                        _ => {}
+                    }
+                }
+                continue; // skip normal-mode key handling this iteration
+            }
+
+            if self.settings_open {
+                if let Some(key) = event::read()?.as_key_press_event() {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('S') => self.settings_open = false,
+                        KeyCode::Char('j') | KeyCode::Down => self.settings_select_next(),
+                        KeyCode::Char('k') | KeyCode::Up => self.settings_select_prev(),
+                        KeyCode::Char('h') | KeyCode::Left => self.settings_adjust(-1),
+                        KeyCode::Char('l') | KeyCode::Right => self.settings_adjust(1),
+                        KeyCode::Enter => self.settings_activate(),
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+
             if crossterm::event::poll(std::time::Duration::from_millis(100))?
                 && let Some(key) = event::read()?.as_key_press_event()
             {
@@ -855,37 +1331,86 @@ impl App {
                     InputMode::Normal => match key.code {
                         KeyCode::Char('e') => self.input_mode = InputMode::Editing,
                         KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Char('t') => self.toggle_tree_view(),
+                        KeyCode::Char('t') => self.set_focus(Focus::Tree),
+                        KeyCode::Char('S') => self.settings_open = !self.settings_open,
+                        KeyCode::Char('x') => self.swap_panels = !self.swap_panels,
                         KeyCode::Up => self.scroll_up(),
                         KeyCode::Down => self.scroll_down(),
                         KeyCode::Tab => {
-                            self.heap_view_mode = match self.heap_view_mode {
-                                HeapViewMode::Metrics => HeapViewMode::Allocations,
-                                HeapViewMode::Allocations => HeapViewMode::Chart,
-                                HeapViewMode::Chart => HeapViewMode::Metrics,
-                            };
+                            self.heap_view_mode =
+                                self.settings.next_enabled_view(self.heap_view_mode);
+                        }
+                        KeyCode::Char('p') => self.set_focus(Focus::ProcList),
+                        KeyCode::Char('r') if self.focus == Focus::ProcList => {
+                            self.refresh_proc_list()
                         }
                         KeyCode::Char(']') => self.next_page(),
                         KeyCode::Char('[') => self.prev_page(),
-                        KeyCode::Char('j') => {
-                            if self.show_tree_view {
-                                self.tree_select_next();
-                            } else {
-                                self.select_next_row();
+                        KeyCode::Char('j') => match self.focus {
+                            Focus::Tree => self.tree_select_next(),
+                            Focus::ProcList => self.proc_list_select_next(),
+                            Focus::AllocTable => match self.heap_view_mode {
+                                HeapViewMode::Histogram => self.histogram_select_next(),
+                                _ => self.select_next_row(),
+                            },
+                        },
+                        KeyCode::Char('k') => match self.focus {
+                            Focus::Tree => self.tree_select_prev(),
+                            Focus::ProcList => self.proc_list_select_prev(),
+                            Focus::AllocTable => match self.heap_view_mode {
+                                HeapViewMode::Histogram => self.histogram_select_prev(),
+                                _ => self.select_prev_row(),
+                            },
+                        },
+                        KeyCode::Enter => match self.focus {
+                            Focus::Tree => self.tree_toggle_collapse(),
+                            Focus::ProcList => {
+                                if let Some(name) = self.selected_proc_name() {
+                                    self.dispatch(&format!("scan {} -h", name));
+                                }
+                            }
+                            Focus::AllocTable => {
+                                if matches!(self.heap_view_mode, HeapViewMode::Histogram) {
+                                    self.jump_to_histogram_bucket();
+                                }
+                            }
+                        },
+                        KeyCode::Char('a') if self.focus == Focus::ProcList => {
+                            if let Some(name) = self.selected_proc_name() {
+                                self.dispatch(&format!("scan {} -a", name));
                             }
                         }
-                        KeyCode::Char('k') => {
-                            if self.show_tree_view {
-                                self.tree_select_prev();
-                            } else {
-                                self.select_prev_row();
+                        KeyCode::Char('v') if self.focus == Focus::ProcList => {
+                            if let Some(name) = self.selected_proc_name() {
+                                self.dispatch(&format!("scan {} -v", name));
                             }
                         }
-                        KeyCode::Enter => {
-                            if self.show_tree_view {
-                                self.tree_toggle_collapse();
+                        KeyCode::Char('b') if self.focus == Focus::ProcList => {
+                            if let Some(name) = self.selected_proc_name() {
+                                self.dispatch(&format!("baseline {}", name));
                             }
                         }
+                        KeyCode::Char('d') if self.focus == Focus::ProcList => {
+                            if let Some(name) = self.selected_proc_name() {
+                                self.dispatch(&format!("diff {}", name));
+                            }
+                        }
+                        KeyCode::Char('i') if self.focus == Focus::ProcList => {
+                            if let Some(name) = self.selected_proc_name() {
+                                self.insert_at_cursor(&format!("{} ", name));
+                                self.input_mode = InputMode::Editing;
+                            }
+                        }
+                        KeyCode::Char('l') if self.focus == Focus::ProcList => {
+                            self.open_prompt(PromptKind::Leak)
+                        }
+                        KeyCode::Char('L') if self.focus == Focus::ProcList => {
+                            self.open_prompt(PromptKind::LeakM)
+                        }
+                        KeyCode::Char('w') if self.focus == Focus::ProcList => {
+                            self.open_prompt(PromptKind::Watch)
+                        }
+
                         _ => {}
                     },
                     InputMode::Editing if key.kind == KeyEventKind::Press => match key.code {
@@ -930,10 +1455,15 @@ impl App {
 
         let help_area = layout[0];
         let input_area = layout[1];
-        let messages_area = layout[2];
         let footer = layout[3];
 
-        self.messages_height = messages_area.height.saturating_sub(2);
+        let (log_area, heap_area) = if self.swap_panels {
+            (innerlayout[1], layout[2])
+        } else {
+            (layout[2], innerlayout[1])
+        };
+
+        self.messages_height = log_area.height.saturating_sub(2);
 
         let (msg, style) = match self.input_mode {
             InputMode::Normal => (
@@ -1000,7 +1530,7 @@ impl App {
             .scroll((self.scroll_offset, 0))
             .wrap(Wrap { trim: false });
 
-        frame.render_widget(messages_widget, messages_area);
+        frame.render_widget(messages_widget, log_area);
 
         let proc_lines = match &self.current_proc {
             Some(name) => {
@@ -1025,12 +1555,27 @@ impl App {
                         Span::styled(label, style),
                     ]));
                 }
+                if let Some((label, style)) = self.compute_badge() {
+                    lines.push(Line::from(vec![
+                        Span::raw("Status  : "),
+                        Span::styled(label, style),
+                    ]));
+                }
+                if let Some((label, style)) = self.compute_watch_badge() {
+                    lines.push(Line::from(Span::styled(label, style)));
+                }
                 lines
             }
-            None => vec![
-                Line::raw("No process scanned yet."),
-                Line::raw("Run: scan <proc> -a"),
-            ],
+            None => {
+                let mut lines = vec![
+                    Line::raw("No process scanned yet."),
+                    Line::raw("Run: scan <proc> -a"),
+                ];
+                if let Some((label, style)) = self.compute_watch_badge() {
+                    lines.push(Line::from(Span::styled(label, style)));
+                }
+                lines
+            }
         };
 
         frame.render_widget(
@@ -1044,13 +1589,25 @@ impl App {
             processlayout[0],
         );
 
-        if self.show_tree_view {
+        if self.focus == Focus::Tree {
             let tree_lines = render_process_tree(
                 &self.tree_rows,
                 self.tree_selected,
                 self.tree_total_memory,
                 &self.theme,
             );
+
+            let inner_height = processlayout[1].height.saturating_sub(2) as usize; // minus borders
+            let header_footer = 4usize;
+            let visible_rows = inner_height.saturating_sub(header_footer);
+            if visible_rows > 0 {
+                if self.tree_selected < self.tree_scroll {
+                    self.tree_scroll = self.tree_selected;
+                } else if self.tree_selected >= self.tree_scroll + visible_rows {
+                    self.tree_scroll = self.tree_selected + 1 - visible_rows;
+                }
+            }
+
             frame.render_widget(
                 Paragraph::new(tree_lines)
                     .block(
@@ -1058,30 +1615,57 @@ impl App {
                             .border_style(Style::default().bg(self.theme.bg).fg(self.theme.border))
                             .title("Process Tree [t to toggle]"),
                     )
-                    .style(Style::default().bg(self.theme.bg).fg(self.theme.cyan)),
+                    .style(Style::default().bg(self.theme.bg).fg(self.theme.cyan))
+                    .scroll((self.tree_scroll as u16, 0)),
                 processlayout[1],
             );
         } else {
-            let args = vec![""];
-            let mut proc_list: Vec<String> = vec![];
-            match commands::list_processes(args) {
-                Ok(procs) => {
-                    for p in procs {
-                        proc_list.push(p);
-                    }
+            if self.proc_list.is_empty() {
+                self.refresh_proc_list();
+            }
+
+            let inner_height = processlayout[1].height.saturating_sub(2) as usize; // minus borders
+            if inner_height > 0 {
+                if self.proc_list_selected < self.proc_list_scroll {
+                    self.proc_list_scroll = self.proc_list_selected;
+                } else if self.proc_list_selected >= self.proc_list_scroll + inner_height {
+                    self.proc_list_scroll = self.proc_list_selected + 1 - inner_height;
                 }
-                Err(e) => self.push_message(format!("Error: {e}")),
+            }
+
+            let list_lines: Vec<Line> = self
+                .proc_list
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    if self.focus == Focus::ProcList && i == self.proc_list_selected {
+                        Line::from(Span::styled(
+                            p.clone(),
+                            Style::default()
+                                .bg(self.theme.highlight_bg)
+                                .fg(self.theme.highlight_fg),
+                        ))
+                    } else {
+                        Line::from(p.clone())
+                    }
+                })
+                .collect();
+
+            let title = if self.focus == Focus::ProcList {
+                "Process List [j/k select  Enter scan-h  i insert  r refresh]"
+            } else {
+                "Process List [p to select] Process Tree [t to toggle]"
             };
-            let list_lines: Vec<Line> = proc_list.into_iter().map(Line::from).collect();
 
             frame.render_widget(
                 Paragraph::new(list_lines)
                     .block(
                         Block::bordered()
                             .border_style(Style::default().bg(self.theme.bg).fg(self.theme.border))
-                            .title("Process List [t for tree]"),
+                            .title(title),
                     )
-                    .style(Style::default().bg(self.theme.bg).fg(self.theme.cyan)),
+                    .style(Style::default().bg(self.theme.bg).fg(self.theme.cyan))
+                    .scroll((self.proc_list_scroll as u16, 0)),
                 processlayout[1],
             );
         }
@@ -1107,10 +1691,10 @@ impl App {
                     .block(
                         Block::bordered()
                             .border_style(Style::default().fg(self.theme.border))
-                            .title("Leak Delta [Tab for metrics]")
+                            .title("Leak Delta [Tab for histogram]")
                             .fg(self.theme.healthy),
                     ),
-                    innerlayout[1],
+                    heap_area,
                 );
             } else {
                 let data: Vec<(f64, f64)> = raw
@@ -1150,7 +1734,7 @@ impl App {
                         DiagnosticSeverity::Reclaimed => self.theme.blue,
                         DiagnosticSeverity::Healthy => self.theme.healthy,
                     };
-                    let panel_w = innerlayout[1].width as usize;
+                    let panel_w = heap_area.width as usize;
                     let short = if msg.len() + 6 > panel_w {
                         format!("  {}", &msg[..panel_w.saturating_sub(6)])
                     } else {
@@ -1181,16 +1765,16 @@ impl App {
                                 .bounds([y_min, y_max])
                                 .labels([label_bot.as_str(), "0", label_top.as_str()]),
                         ),
-                    innerlayout[1],
+                    heap_area,
                 );
             }
         } else {
             let heap_lines = match &self.heap_history.last() {
                 None => vec![Line::raw("No heap data."), Line::raw("Run: scan <proc> -h")],
                 Some(snap) => {
-                    let panel_height = innerlayout[1].height as usize;
+                    let panel_height = heap_area.height as usize;
                     self.alloc_table_page_size = panel_height.saturating_sub(6);
-                    let w = innerlayout[1].width as usize;
+                    let w = heap_area.width.saturating_sub(2) as usize;
 
                     match self.heap_view_mode {
                         HeapViewMode::Metrics => render_heap_metrics(snap, w, &self.theme),
@@ -1201,6 +1785,9 @@ impl App {
                             self.alloc_table_selected,
                             &self.theme,
                         ),
+                        HeapViewMode::Histogram => {
+                            render_histogram(snap, w, self.histogram_selected, &self.theme)
+                        }
                         HeapViewMode::Chart => unreachable!(),
                     }
                 }
@@ -1212,65 +1799,111 @@ impl App {
                         .border_style(Style::default().fg(self.theme.border))
                         .title(match self.heap_view_mode {
                             HeapViewMode::Metrics => "Heap View [Tab for table]",
-                            HeapViewMode::Allocations => "Heap View [Tab for metrics]",
+                            HeapViewMode::Allocations => "Heap View [Tab for chart]",
+                            HeapViewMode::Histogram => {
+                                "Allocation Histogram [Tab: metrics · Enter: jump]"
+                            }
                             HeapViewMode::Chart => unreachable!(),
                         })
                         .fg(self.theme.healthy),
                 ),
-                innerlayout[1],
+                heap_area,
             );
+
+            if let Some(p) = &self.prompt {
+                let area = frame.area();
+                let w = 40.min(area.width.saturating_sub(4));
+                let h = (p.fields.len() as u16 + 4).min(area.height.saturating_sub(4));
+                let x = (area.width.saturating_sub(w)) / 2;
+                let y = (area.height.saturating_sub(h)) / 2;
+                let popup = ratatui::layout::Rect::new(x, y, w, h);
+
+                frame.render_widget(ratatui::widgets::Clear, popup);
+
+                let title = match p.kind {
+                    PromptKind::Leak => "leak",
+                    PromptKind::LeakM => "leak-m",
+                    PromptKind::Watch => "watch",
+                };
+
+                let mut lines = vec![Line::raw(format!("proc: {}", p.proc_name)), Line::raw("")];
+                for (i, f) in p.fields.iter().enumerate() {
+                    let style = if i == p.selected {
+                        Style::default()
+                            .bg(self.theme.highlight_bg)
+                            .fg(self.theme.highlight_fg)
+                    } else {
+                        Style::default().fg(self.theme.text)
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("{}: {}", f.label, f.value),
+                        style,
+                    )));
+                }
+                lines.push(Line::raw(""));
+                lines.push(Line::raw("Tab next  Enter confirm  Esc cancel"));
+
+                frame.render_widget(
+                    Paragraph::new(lines)
+                        .block(
+                            Block::bordered()
+                                .border_style(Style::default().fg(self.theme.growth_warning))
+                                .title(title),
+                        )
+                        .style(Style::default().bg(self.theme.bg).fg(self.theme.text)),
+                    popup,
+                );
+            }
         }
 
         let footer_text = match self.input_mode {
-            InputMode::Normal => Line::from(vec![
-                Span::styled(
-                    " NORMAL ",
-                    Style::default().fg(self.theme.bg).bg(self.theme.healthy),
-                ),
-                Span::raw("  press "),
-                Span::styled(
-                    "e",
-                    Style::default()
-                        .fg(self.theme.growth_warning)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" to type a command  •  "),
-                Span::styled(
-                    "q",
-                    Style::default()
-                        .fg(self.theme.growth_warning)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" to quit  •  "),
-                Span::styled(
-                    "tab",
-                    Style::default()
-                        .fg(self.theme.growth_warning)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" toggle heap view  •  "),
-                Span::styled(
-                    "↑↓",
-                    Style::default()
-                        .fg(self.theme.growth_warning)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" scroll output  •  "),
-                Span::styled(
-                    "t",
-                    Style::default()
-                        .fg(self.theme.growth_warning)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" tree view  •  "),
-                Span::styled(
-                    "[/]",
-                    Style::default()
-                        .fg(self.theme.growth_warning)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" prev/next page"),
-            ]),
+            InputMode::Normal => {
+                let mut spans = vec![
+                    Span::styled(
+                        " NORMAL ",
+                        Style::default().fg(self.theme.bg).bg(self.theme.healthy),
+                    ),
+                    Span::raw("  "),
+                ];
+                let hint = |k: &str, desc: &str| -> Vec<Span<'static>> {
+                    vec![
+                        Span::styled(
+                            k.to_string(),
+                            Style::default()
+                                .fg(self.theme.growth_warning)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!(" {}  •  ", desc)),
+                    ]
+                };
+                spans.extend(hint("e", "edit"));
+                spans.extend(hint("q", "quit"));
+                spans.extend(hint("?", "help"));
+                match self.focus {
+                    Focus::ProcList => {
+                        spans.extend(hint("j/k", "select"));
+                        spans.extend(hint("Enter", "scan-h"));
+                        spans.extend(hint("a/v", "scan"));
+                        spans.extend(hint("b/d", "baseline/diff"));
+                        spans.extend(hint("l/L/w", "leak/leak-m/watch"));
+                        spans.extend(hint("i", "insert name"));
+                        spans.extend(hint("r", "refresh"));
+                    }
+                    Focus::Tree => {
+                        spans.extend(hint("j/k", "select"));
+                        spans.extend(hint("Enter", "expand/collapse"));
+                    }
+                    Focus::AllocTable => {
+                        spans.extend(hint("j/k", "select row"));
+                        spans.extend(hint("[/]", "page"));
+                        spans.extend(hint("Tab", "heap view"));
+                    }
+                }
+                spans.extend(hint("t/p", "toggle tree/proclist"));
+                spans.extend(hint("x", "swap output/heap panels"));
+                spans.extend(hint("S", "settings"));
+                Line::from(spans)
+            }
             InputMode::Editing => Line::from(vec![
                 Span::styled(
                     " INSERT ",
@@ -1279,11 +1912,13 @@ impl App {
                         .bg(self.theme.growth_warning),
                 ),
                 Span::raw("  try: "),
-                Span::styled("scan notepad.exe -a", Style::default().fg(self.theme.cyan)),
+                Span::styled("scan <proc_name> -a", Style::default().fg(self.theme.cyan)),
                 Span::raw("  •  "),
-                Span::styled("scan notepad.exe -h", Style::default().fg(self.theme.cyan)),
+                Span::styled("scan <proc_name> -h", Style::default().fg(self.theme.cyan)),
                 Span::raw("  •  "),
-                Span::styled("leak notepad.exe 10", Style::default().fg(self.theme.cyan)),
+                Span::styled("leak <proc_name> 10", Style::default().fg(self.theme.cyan)),
+                Span::raw("  •  "),
+                Span::styled("watch <proc_name> -l", Style::default().fg(self.theme.cyan)),
                 Span::raw("  •  "),
                 Span::styled("list", Style::default().fg(self.theme.cyan)),
                 Span::raw("  •  "),
@@ -1303,6 +1938,97 @@ impl App {
                 .wrap(Wrap { trim: true }),
             footer,
         );
+
+        if self.settings_open {
+            let area = frame.area();
+            let w = 56.min(area.width.saturating_sub(4));
+            let h = (SETTINGS_ROW_COUNT as u16 + 5).min(area.height.saturating_sub(4));
+            let x = (area.width.saturating_sub(w)) / 2;
+            let y = (area.height.saturating_sub(h)) / 2;
+            let popup = ratatui::layout::Rect::new(x, y, w, h);
+            frame.render_widget(ratatui::widgets::Clear, popup);
+
+            let row_style = |i: usize, theme: &Theme| {
+                if i == self.settings_selected {
+                    Style::default()
+                        .bg(theme.highlight_bg)
+                        .fg(theme.highlight_fg)
+                } else {
+                    Style::default().fg(theme.text)
+                }
+            };
+
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    format!(
+                        "{:<22} {}",
+                        "Watch interval (ms)", self.settings.watch_interval_millis
+                    ),
+                    row_style(0, &self.theme),
+                )),
+                Line::from(Span::styled(
+                    format!("{:<22} {:?}", "Theme", self.settings.theme_kind),
+                    row_style(1, &self.theme),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "{:<22} {:.1}",
+                        "Badge: Caution MB/s", self.settings.badge_caution_mb_s
+                    ),
+                    row_style(2, &self.theme),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "{:<22} {:.1}",
+                        "Badge: Warning MB/s", self.settings.badge_warning_mb_s
+                    ),
+                    row_style(3, &self.theme),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "{:<22} {:.1}",
+                        "Badge: Critical MB/s", self.settings.badge_critical_mb_s
+                    ),
+                    row_style(4, &self.theme),
+                )),
+            ];
+            for (i, mode) in HEAP_VIEW_ORDER.iter().enumerate() {
+                let mark = if self.settings.enabled_views[i] {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{:<22} {}",
+                        format!("View: {}", heap_view_label(*mode)),
+                        mark
+                    ),
+                    row_style(5 + i, &self.theme),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{:<22} {}",
+                    "Default view",
+                    heap_view_label(self.settings.default_view())
+                ),
+                row_style(9, &self.theme),
+            )));
+            lines.push(Line::raw(""));
+            lines.push(Line::raw("j/k select  h/l adjust  Enter toggle  Esc close"));
+
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(
+                        Block::bordered()
+                            .border_style(Style::default().fg(self.theme.growth_warning))
+                            .title("Settings"),
+                    )
+                    .style(Style::default().bg(self.theme.bg).fg(self.theme.text)),
+                popup,
+            );
+        }
     }
 }
 
@@ -1584,6 +2310,95 @@ fn render_process_tree(
     lines
 }
 
+fn render_histogram(
+    snap: &HeapSnapshot,
+    width: usize,
+    selected: usize,
+    theme: &crate::ui::theme::Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![];
+
+    let used_blocks: Vec<_> = snap.blocks.iter().filter(|b| !b.is_free).collect();
+    let total = used_blocks.len();
+
+    let mut counts = [0usize; SIZE_BUCKETS.len()];
+    let mut bytes = [0u64; SIZE_BUCKETS.len()];
+    for block in &used_blocks {
+        for (i, &(_, lo, hi)) in SIZE_BUCKETS.iter().enumerate() {
+            if block.size > lo && block.size <= hi {
+                counts[i] += 1;
+                bytes[i] += block.size as u64;
+                break;
+            }
+        }
+    }
+
+    let max_count = counts.iter().copied().max().unwrap_or(0).max(1);
+    let label_w = SIZE_BUCKETS
+        .iter()
+        .map(|(l, _, _)| l.len())
+        .max()
+        .unwrap_or(0);
+    let count_w = 6;
+    let bar_w = width.saturating_sub(label_w + count_w + 4).max(4);
+
+    lines.push(Line::raw(format!(
+        "── Allocation Size Distribution  ({total} used blocks) ──"
+    )));
+    lines.push(Line::raw(""));
+
+    for (i, &(label, _, _)) in SIZE_BUCKETS.iter().enumerate() {
+        let count = counts[i];
+        let fill = (((count as f64 / max_count as f64) * bar_w as f64).round() as usize).min(bar_w);
+
+        // colour ramp mirrors the LARGE/medium thresholds from render_alloc_table
+        let color = if i >= 4 {
+            theme.growth_critical
+        } else if i >= 2 {
+            theme.growth_warning
+        } else {
+            theme.healthy
+        };
+
+        let bar_style = if i == selected {
+            Style::default()
+                .bg(theme.highlight_bg)
+                .fg(theme.highlight_fg)
+        } else {
+            Style::default().fg(color)
+        };
+        let label_style = if i == selected {
+            Style::default().bg(theme.border).fg(theme.text)
+        } else {
+            Style::default().fg(theme.text)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label:<label_w$} "), label_style),
+            Span::styled("█".repeat(fill), bar_style),
+            Span::styled("░".repeat(bar_w - fill), Style::default().fg(theme.border)),
+            Span::styled(format!(" {count:>count_w$}"), label_style),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    if let Some(&(label, _, _)) = SIZE_BUCKETS.get(selected) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Selected: {label}  —  {} blocks, {} total",
+                counts[selected],
+                format_bytes(bytes[selected])
+            ),
+            Style::default().fg(theme.cyan),
+        )));
+    }
+    lines.push(Line::raw(
+        "j/k select bucket   Enter → jump to allocations   Tab → metrics",
+    ));
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1591,7 +2406,7 @@ mod tests {
     // ── helpers ─────────────────────────────────────────────────────────────
 
     fn make_app() -> App {
-        App::new(ThemeKind::default().theme())
+        App::new(ThemeKind::default())
     }
 
     fn make_app_with_heap() -> App {
@@ -1632,7 +2447,7 @@ mod tests {
 
     #[test]
     fn clear_command_removes_output_and_resets_scroll() {
-        let mut app = App::new(ThemeKind::default().theme());
+        let mut app = App::new(ThemeKind::default());
         app.messages_height = 1;
         app.push_message("old output".into());
         app.scroll_down();
@@ -1647,7 +2462,7 @@ mod tests {
 
     #[test]
     fn help_mentions_clear_command() {
-        let mut app = App::new(ThemeKind::default().theme());
+        let mut app = App::new(ThemeKind::default());
 
         app.input = "help".into();
         app.character_index = app.input.chars().count();
@@ -1890,6 +2705,18 @@ mod tests {
         assert_eq!(badge.1.fg.unwrap(), app.theme.growth_critical);
     }
 
+    #[test]
+    fn watch_badge_shows_target_and_mode() {
+        let mut app = make_app();
+        assert!(app.compute_watch_badge().is_none());
+
+        app.watch_target = Some("notepad.exe".into());
+        app.watch_mode = Some("-l".into());
+        let (label, _) = app.compute_watch_badge().unwrap();
+        assert!(label.contains("notepad.exe"));
+        assert!(label.contains("-l"));
+    }
+
     // ── tree view ────────────────────────────────────────────────────────────
 
     fn make_tree_rows() -> Vec<TreeDisplayRow> {
@@ -1924,11 +2751,13 @@ mod tests {
     #[test]
     fn toggle_tree_view_flips_state() {
         let mut app = make_app();
-        assert!(!app.show_tree_view);
-        app.show_tree_view = !app.show_tree_view;
-        assert!(app.show_tree_view);
-        app.show_tree_view = !app.show_tree_view;
-        assert!(!app.show_tree_view);
+        assert_eq!(app.focus, Focus::AllocTable);
+
+        app.set_focus(Focus::Tree);
+        assert_eq!(app.focus, Focus::Tree);
+
+        app.set_focus(Focus::Tree); // pressing 't' again toggles back
+        assert_eq!(app.focus, Focus::AllocTable);
     }
 
     #[test]
@@ -1985,5 +2814,12 @@ mod tests {
                 .iter()
                 .any(|l| l.to_string().contains("Total group memory"))
         );
+    }
+    #[test]
+    fn swap_panels_toggles() {
+        let mut app = make_app();
+        assert!(!app.swap_panels);
+        app.swap_panels = !app.swap_panels;
+        assert!(app.swap_panels);
     }
 }

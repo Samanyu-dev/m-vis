@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A single memory region in a process's address space.
 ///
@@ -40,7 +40,7 @@ pub enum RegionKind {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RegionProtect {
     NoAccess,
     Readonly,
@@ -50,7 +50,7 @@ pub enum RegionProtect {
     Other,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HeapBlock {
     pub address: usize,
     pub size: usize,

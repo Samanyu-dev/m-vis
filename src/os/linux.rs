@@ -9,7 +9,7 @@ pub struct LinuxMemory;
 
 impl MemoryProvider for LinuxMemory {
     fn walk_regions(&self, pid: u32) -> Result<Vec<Region>, String> {
-        Ok(walk_regions(pid))
+        walk_regions(pid)
     }
 
     fn walk_heap(&self, pid: u32) -> Result<Vec<HeapBlock>, String> {
@@ -22,12 +22,24 @@ impl MemoryProvider for LinuxMemory {
 }
 
 /// Reads `/proc/<pid>/maps` and returns all mapped virtual memory regions for the process.
-pub fn walk_regions(pid: u32) -> Vec<Region> {
+pub fn walk_regions(pid: u32) -> Result<Vec<Region>, String> {
     let path = format!("/proc/{}/maps", pid);
-    let content = fs::read_to_string(path).expect("failed to read maps");
+    let content = fs::read_to_string(path).map_err(|e| format!("failed to read maps: {}", e))?;
     let mut regions = Vec::new();
+    let mut region_count = 0;
+    const MAX_REGIONS_PER_PROCESS: usize = 100_000;
 
     for line in content.lines() {
+        region_count += 1;
+        if region_count % 10_000 == 0 {
+            eprintln!(
+                "walk_regions: processed {} regions for pid {}",
+                region_count, pid
+            );
+        }
+        if region_count > MAX_REGIONS_PER_PROCESS {
+            return Err("Process has too many regions".into());
+        }
         // each line looks like:
         // 55a3b2000000-55a3b2001000 r--p 00000000 08:01 123456  /usr/bin/cat
         let mut parts = line.splitn(6, ' ');
@@ -72,51 +84,171 @@ pub fn walk_regions(pid: u32) -> Vec<Region> {
             name: region_name,
         });
     }
-
-    regions
+    Ok(regions)
 }
 
-/// Reads `/proc/<pid>/smaps` and returns heap blocks for the process.
 pub fn walk_heap(pid: u32) -> Vec<HeapBlock> {
-    let path = format!("/proc/{}/smaps", pid);
-    let content = fs::read_to_string(path).expect("failed to read maps");
     let mut blocks = Vec::new();
-    let mut current_start = 0usize;
-    let mut in_heap = false;
-    let mut protect: RegionProtect;
 
-    for line in content.lines() {
-        if line.contains("[heap]") {
-            in_heap = true;
-            let range = line.split_whitespace().next().unwrap_or("");
-            let mut parts = range.split('-');
-            current_start = usize::from_str_radix(parts.next().unwrap_or("0"), 16).unwrap_or(0);
-        } else if in_heap && line.starts_with("Size:") {
-            let perms = line.split_whitespace().nth(1).unwrap_or("");
-            if perms.contains('x') {
-                protect = RegionProtect::Execute;
-            } else if perms.contains('w') {
-                protect = RegionProtect::ReadWrite;
-            } else if perms.contains('r') {
-                protect = RegionProtect::Readonly;
-            } else {
-                protect = RegionProtect::NoAccess;
-            };
-            let kb: usize = line
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-            blocks.push(HeapBlock {
-                address: current_start,
-                size: kb * 1024,
-                is_free: false,
-                vm_protect: protect,
-            });
-            in_heap = false;
+    let maps_path = format!("/proc/{}/maps", pid);
+    let maps_content = match fs::read_to_string(&maps_path) {
+        Ok(c) => c,
+        Err(_) => return blocks,
+    };
+
+    let mut heap_start = 0usize;
+    let mut heap_end = 0usize;
+    let mut vm_protect = RegionProtect::NoAccess;
+
+    for line in maps_content.lines() {
+        if !line.contains("[heap]") {
+            continue;
         }
+
+        let mut parts = line.splitn(6, ' ');
+        let range = parts.next().unwrap_or("");
+        let perms = parts.next().unwrap_or("");
+
+        let mut range_parts = range.split('-');
+        heap_start = usize::from_str_radix(range_parts.next().unwrap_or("0"), 16).unwrap_or(0);
+        heap_end = usize::from_str_radix(range_parts.next().unwrap_or("0"), 16).unwrap_or(0);
+
+        vm_protect = if perms.contains('x') {
+            RegionProtect::Execute
+        } else if perms.contains('w') {
+            RegionProtect::ReadWrite
+        } else if perms.contains('r') {
+            RegionProtect::Readonly
+        } else {
+            RegionProtect::NoAccess
+        };
+
+        break; // only one [heap] entry exists, stop looking
     }
+
+    if heap_start > 0 && heap_end > heap_start {
+        blocks.push(HeapBlock {
+            address: heap_start,
+            size: heap_end - heap_start,
+            is_free: false,
+            vm_protect,
+        });
+    }
+
+    blocks
+}
+
+/// Reads `/proc/<pid>/smaps` (or `/proc/<pid>/mem`) and returns individual glibc heap chunks.
+pub fn walk_heap_granular(pid: u32) -> Vec<HeapBlock> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut blocks = Vec::new();
+
+    let maps_path = format!("/proc/{}/maps", pid);
+    let maps_content = match fs::read_to_string(&maps_path) {
+        Ok(c) => c,
+        Err(_) => return blocks,
+    };
+
+    let mut heap_start = 0usize;
+    let mut heap_end = 0usize;
+    let mut vm_protect = RegionProtect::NoAccess;
+
+    for line in maps_content.lines() {
+        if !line.contains("[heap]") {
+            continue;
+        }
+
+        let mut parts = line.splitn(6, ' ');
+        let range = parts.next().unwrap_or("");
+        let perms = parts.next().unwrap_or("");
+
+        let mut range_parts = range.split('-');
+        heap_start = usize::from_str_radix(range_parts.next().unwrap_or("0"), 16).unwrap_or(0);
+        heap_end = usize::from_str_radix(range_parts.next().unwrap_or("0"), 16).unwrap_or(0);
+
+        vm_protect = if perms.contains('x') {
+            RegionProtect::Execute
+        } else if perms.contains('w') {
+            RegionProtect::ReadWrite
+        } else if perms.contains('r') {
+            RegionProtect::Readonly
+        } else {
+            RegionProtect::NoAccess
+        };
+
+        break; // only one [heap] entry exists, stop looking
+    }
+
+    if heap_start == 0 || heap_end <= heap_start {
+        return blocks; // no heap found, nothing to walk
+    }
+
+    let mem_path = format!("/proc/{}/mem", pid);
+    let mut mem = match std::fs::File::open(&mem_path) {
+        Ok(f) => f,
+        Err(_) => return blocks,
+    };
+
+    const HEADER_SIZE: usize = 16;
+    const PREV_INUSE: usize = 0x1;
+    const SIZE_MASK: usize = !0x7; // clears the low 3 flag bits, keeps real size
+
+    let read_header = |mem: &mut std::fs::File, addr: usize| -> io::Result<(usize, usize)> {
+        let mut buf = [0u8; HEADER_SIZE];
+        mem.seek(SeekFrom::Start(addr as u64))?;
+        mem.read_exact(&mut buf)?;
+        let prev_size = usize::from_le_bytes(buf[0..8].try_into().unwrap());
+        let size = usize::from_le_bytes(buf[8..16].try_into().unwrap());
+        Ok((prev_size, size))
+    };
+
+    let mut addr = heap_start;
+
+    // read the very first chunk so we have something to inspect each loop
+    let (_, mut current_size_field) = match read_header(&mut mem, addr) {
+        Ok(h) => h,
+        Err(_) => return blocks, // can't read heap memory at all
+    };
+
+    loop {
+        let chunk_size = current_size_field & SIZE_MASK;
+
+        // safety valve: if size is garbage, stop instead of looping forever
+        if chunk_size < HEADER_SIZE {
+            break;
+        }
+
+        let next_addr = addr + chunk_size;
+
+        // reached the end of the heap region — this last chunk is the "top
+        // chunk" (glibc's remaining unused arena space), not a real
+        // allocation, so we stop here rather than reporting it as a block.
+        if next_addr >= heap_end {
+            break;
+        }
+
+        // read the NEXT chunk's header, because its PREV_INUSE bit tells us
+        // whether THIS chunk (at `addr`) is free or in use
+        let (_, next_size_field) = match read_header(&mut mem, next_addr) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        let is_free = next_size_field & PREV_INUSE == 0;
+
+        // usable memory starts right after this chunk's own header
+        blocks.push(HeapBlock {
+            address: addr + HEADER_SIZE,
+            size: chunk_size - HEADER_SIZE,
+            is_free,
+            vm_protect: vm_protect.clone(),
+        });
+
+        // move to the next chunk and repeat
+        addr = next_addr;
+        current_size_field = next_size_field;
+    }
+
     blocks
 }
 

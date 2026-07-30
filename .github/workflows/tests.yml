@@ -38,3 +38,156 @@ jobs:
         run: cargo fmt -- --check
       - name: Run benchmarks
         run: cargo bench
+  ci-integration:
+    name: CI subcommand tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install gcc (Windows)
+        if: matrix.os == 'windows-latest'
+        run: choco install mingw -y
+
+      - name: Compile leak test binary (Windows)
+        if: matrix.os == 'windows-latest'
+        run: gcc tests/test_programs/leak_test_c.c -o tests/test_programs/leak_test_c.exe
+
+      - name: Compile leak test binary (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: gcc tests/test_programs/leak_test_c.c -o tests/test_programs/leak_test_c
+
+      - name: Build mvis
+        run: cargo build
+      
+      - name: Allow ptrace (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+      
+      - name: Run CI integration tests
+        run: cargo test --test ci_integration
+  action-smoke-test:
+    name: Action smoke test (${{ matrix.os }})
+    needs: ci-integration
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gcc (Windows)
+        if: matrix.os == 'windows-latest'
+        run: choco install mingw -y
+
+      - name: Compile leak test binary (Windows)
+        if: matrix.os == 'windows-latest'
+        run: gcc tests/test_programs/leak_test_c.c -o tests/test_programs/leak_test_c.exe
+
+      - name: Compile leak test binary (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: gcc tests/test_programs/leak_test_c.c -o tests/test_programs/leak_test_c
+
+      - name: Allow ptrace (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+
+      - name: Resolve leak binary path
+        id: bin
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "path=$(cygpath -w "$GITHUB_WORKSPACE/tests/test_programs/leak_test_c.exe")" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=$GITHUB_WORKSPACE/tests/test_programs/leak_test_c" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Smoke test | max-memory breach
+        id: breach
+        continue-on-error: true
+        uses: ./
+        with:
+          version: v0.5.0-rc1
+          spawn: ${{ steps.bin.outputs.path }}
+          max-memory: 10
+          duration: 30
+          format: junit
+          output: breach-report.xml
+
+      - name: Assert breach step failed
+        shell: bash
+        run: |
+          if [ "${{ steps.breach.outcome }}" != "failure" ]; then
+            echo "::error::expected failure on max-memory breach, got: ${{ steps.breach.outcome }}"
+            exit 1
+          fi
+
+      - name: Smoke test | clean pass
+        id: clean
+        continue-on-error: true
+        uses: ./
+        with:
+          version: v0.5.0-rc1
+          spawn: ${{ steps.bin.outputs.path }}
+          max-memory: 4096
+          duration: 3
+          format: junit
+          output: clean-report.xml
+
+      - name: Assert clean step passed
+        shell: bash
+        run: |
+          if [ "${{ steps.clean.outcome }}" != "success" ]; then
+            echo "::error::expected clean pass with generous limits, got: ${{ steps.clean.outcome }}"
+            exit 1
+          fi
+
+      - name: Assert clean report exists
+        shell: bash
+        run: test -f clean-report.xml || { echo "::error::clean-report.xml was not written"; exit 1; }
+
+      - name: Smoke test | leak-check detects leak
+        id: leakcheck
+        continue-on-error: true
+        uses: ./
+        with:
+          version: v0.5.0-rc1
+          spawn: ${{ steps.bin.outputs.path }}
+          leak-check: true
+          duration: 15
+          format: junit
+          output: leak-report.xml
+
+      - name: Assert leak-check step failed
+        shell: bash
+        run: |
+          if [ "${{ steps.leakcheck.outcome }}" != "failure" ]; then
+            echo "::error::expected failure from leak-check against leaking binary, got: ${{ steps.leakcheck.outcome }}"
+            exit 1
+          fi
+
+      - name: Upload smoke test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-reports-${{ matrix.os }}
+          path: "*-report.xml"
+          if-no-files-found: warn
