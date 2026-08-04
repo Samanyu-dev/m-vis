@@ -5,6 +5,9 @@ mod windows;
 pub use windows::find_blocks_with_pointers;
 
 #[cfg(target_os = "windows")]
+pub use windows::find_pointer_edges;
+
+#[cfg(target_os = "windows")]
 pub use windows::walk_heap_granular;
 
 #[cfg(target_os = "windows")]

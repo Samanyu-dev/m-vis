@@ -20,6 +20,7 @@ pub struct ScanResult {
     pub frag: f64,
     pub pointer_blocks: std::collections::HashSet<usize>,
     pub referenced_blocks: std::collections::HashSet<usize>,
+    pub pointer_edges: std::collections::HashMap<usize, Vec<crate::types::PointerEdge>>,
 }
 
 use std::sync::mpsc::Sender;
@@ -93,13 +94,18 @@ pub fn scan(args: Vec<&str>) -> Result<ScanResult, String> {
     let raw = get_heap_blocks(pid, granular);
 
     #[cfg(target_os = "windows")]
-    let (pointer_blocks, referenced_blocks) = crate::os::find_blocks_with_pointers(pid, &raw);
-
+    let pointer_edges = crate::os::find_pointer_edges(pid, &raw);
     #[cfg(not(target_os = "windows"))]
-    let (pointer_blocks, referenced_blocks) = (
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-    );
+    let pointer_edges: std::collections::HashMap<usize, Vec<crate::types::PointerEdge>> =
+        std::collections::HashMap::new();
+
+    let pointer_blocks: std::collections::HashSet<usize> = pointer_edges.keys().copied().collect();
+    let referenced_blocks: std::collections::HashSet<usize> = pointer_edges
+        .values()
+        .flatten()
+        .filter(|e| !e.target_is_free)
+        .map(|e| e.target)
+        .collect();
 
     // get memory usage from sysinfo
     use sysinfo::System;
@@ -143,6 +149,7 @@ pub fn scan(args: Vec<&str>) -> Result<ScanResult, String> {
         frag,
         pointer_blocks,
         referenced_blocks,
+        pointer_edges,
     })
 }
 

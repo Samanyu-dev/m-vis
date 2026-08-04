@@ -19,7 +19,8 @@ use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, 
 
 use crate::os::MemoryProvider;
 use crate::types::{
-    HeapBlock, ModuleInfo, ModuleStatus, Region, RegionKind, RegionProtect, RegionState,
+    HeapBlock, ModuleInfo, ModuleStatus, PointerEdge, Region, RegionKind, RegionProtect,
+    RegionState,
 };
 
 pub struct WindowsMemory;
@@ -408,37 +409,40 @@ pub fn walk_heap_granular(pid: u32) -> Vec<HeapBlock> {
     blocks
 }
 
-/// Scans live heap blocks for pointers that reference other live heap blocks.
+/// Scans live heap blocks for pointer-like values and resolves each against
+/// the full block list (live + free) via binary search.
 ///
-///
-/// ## Returns two sets:
-/// - **tagged** — blocks that *contain* a pointer to another heap block
-/// - **referenced** — blocks that are *pointed to* by another heap block
-pub fn find_blocks_with_pointers(
-    pid: u32,
-    blocks: &[HeapBlock],
-) -> (
-    std::collections::HashSet<usize>,
-    std::collections::HashSet<usize>,
-) {
+/// Edges into a freed block are marked `target_is_free: true` — a live block
+/// still holding a reference to freed memory is a dangling-pointer / UAF signal.
+pub fn find_pointer_edges(pid: u32, blocks: &[HeapBlock]) -> HashMap<usize, Vec<PointerEdge>> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 
-    let mut tagged = std::collections::HashSet::new();
-    let mut referenced = std::collections::HashSet::new();
+    let mut edges: HashMap<usize, Vec<PointerEdge>> = HashMap::new();
 
     unsafe {
         let proc_handle = match OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
         {
             Ok(h) => h,
-            Err(_) => return (tagged, referenced),
+            Err(_) => return edges,
         };
 
-        let live_ranges: Vec<(usize, usize)> = blocks
+        // (start, end, is_free) sorted by start — O(log n) containment lookup
+        // instead of the old linear scan per pointer word.
+        let mut ranges: Vec<(usize, usize, bool)> = blocks
             .iter()
-            .filter(|b| !b.is_free)
-            .map(|b| (b.address, b.address + b.size))
+            .map(|b| (b.address, b.address + b.size, b.is_free))
             .collect();
+        ranges.sort_by_key(|&(start, _, _)| start);
+
+        let find_containing = |value: usize| -> Option<(usize, bool)> {
+            let idx = ranges.partition_point(|&(start, _, _)| start <= value);
+            if idx == 0 {
+                return None;
+            }
+            let (start, end, is_free) = ranges[idx - 1];
+            (value >= start && value < end).then_some((start, is_free))
+        };
 
         for block in blocks.iter().filter(|b| !b.is_free) {
             let mut buf = vec![0u8; block.size.min(4096)];
@@ -460,21 +464,45 @@ pub fn find_blocks_with_pointers(
             while offset + 8 <= bytes_read {
                 let value = usize::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
 
-                if let Some((start, _)) = live_ranges
-                    .iter()
-                    .find(|(start, end)| value >= *start && value < *end)
+                if let Some((target, target_is_free)) = find_containing(value)
+                    && target != block.address
                 {
-                    tagged.insert(block.address); // this block contains a pointer
-                    referenced.insert(*start); // that block is pointed to
+                    let out = edges.entry(block.address).or_default();
+                    if !out.iter().any(|e: &PointerEdge| e.target == target) {
+                        out.push(PointerEdge {
+                            target,
+                            target_is_free,
+                        });
+                    }
                 }
 
-                offset += 1;
+                offset += 8;
             }
         }
 
         CloseHandle(proc_handle).ok();
     }
 
+    edges
+}
+
+/// Coarse tagged/referenced sets for the Allocations table, derived from the
+/// same edge graph the Pointer Tree view uses.
+pub fn find_blocks_with_pointers(
+    pid: u32,
+    blocks: &[HeapBlock],
+) -> (
+    std::collections::HashSet<usize>,
+    std::collections::HashSet<usize>,
+) {
+    let edges = find_pointer_edges(pid, blocks);
+    let tagged: std::collections::HashSet<usize> = edges.keys().copied().collect();
+    let referenced: std::collections::HashSet<usize> = edges
+        .values()
+        .flatten()
+        .filter(|e| !e.target_is_free)
+        .map(|e| e.target)
+        .collect();
     (tagged, referenced)
 }
 
