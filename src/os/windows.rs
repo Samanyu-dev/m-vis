@@ -409,6 +409,40 @@ pub fn walk_heap_granular(pid: u32) -> Vec<HeapBlock> {
     blocks
 }
 
+/// Reads `size` raw bytes from target process memory at `address`.
+pub fn read_process_memory_bytes(pid: u32, address: usize, size: usize) -> Result<Vec<u8>, String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    };
+
+    unsafe {
+        let proc_handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
+            .map_err(|e| format!("Failed to open process {pid}: {e:?}"))?;
+
+        let mut buf = vec![0u8; size];
+        let mut bytes_read = 0usize;
+
+        let ok = ReadProcessMemory(
+            proc_handle,
+            address as *const _,
+            buf.as_mut_ptr() as *mut _,
+            size,
+            Some(&mut bytes_read),
+        );
+
+        CloseHandle(proc_handle).ok();
+
+        if ok.is_ok() && bytes_read > 0 {
+            buf.truncate(bytes_read);
+            Ok(buf)
+        } else {
+            Err(format!("Failed to read memory at 0x{address:x} for PID {pid}"))
+        }
+    }
+}
+
 /// Scans live heap blocks for pointer-like values and resolves each against
 /// the full block list (live + free) via binary search.
 ///

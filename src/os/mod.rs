@@ -2,6 +2,9 @@
 mod windows;
 
 #[cfg(target_os = "windows")]
+pub use windows::read_process_memory_bytes;
+
+#[cfg(target_os = "windows")]
 pub use windows::find_blocks_with_pointers;
 
 #[cfg(target_os = "windows")]

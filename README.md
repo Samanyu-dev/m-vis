@@ -82,6 +82,7 @@ mvis leak notepad 10
 - **DLL Tracking**: Monitor and list all dynamic libraries (DLLs/SOs/Dylibs) loaded by a target.
 - **Real time Memory Leak Detection**: Identify and monitor processes with growing, unreleased memory allocations.
 - **Leak Delta Chart**: m-vis includes a real time leak delta chart that visualizes memory allocation trends over time directly in the TUI.
+- **Raw Memory Inspection**: Dump and inspect raw hex/ASCII bytes around arbitrary memory addresses in live processes.
 - **Universal OS Support**: 100% native support for Windows, Linux, and macOS.
 
 ---
@@ -150,6 +151,9 @@ mvis scan notepad.exe -h
 
 # detect leaks
 mvis leak notepad.exe 10
+
+# dump raw memory bytes
+mvis dump notepad.exe 0x7ff123456780 128
 
 # multi sample leak detection
 mvis leak-m notepad.exe 10 3
