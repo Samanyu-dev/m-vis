@@ -2,9 +2,6 @@
 mod windows;
 
 #[cfg(target_os = "windows")]
-pub use windows::read_process_memory_bytes;
-
-#[cfg(target_os = "windows")]
 pub use windows::find_blocks_with_pointers;
 
 #[cfg(target_os = "windows")]
@@ -48,4 +45,6 @@ pub trait MemoryProvider {
     ///
     /// Pass `"-t"` as `flag` to restrict the output to tampered or injected modules only.
     fn list_modules(&self, pid: u32, flag: String) -> Result<Vec<ModuleInfo>, String>;
+
+    fn read_process_memory(&self, pid: u32, address: usize, size: usize) -> Result<Vec<u8>, String>;
 }

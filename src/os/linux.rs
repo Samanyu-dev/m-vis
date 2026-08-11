@@ -19,6 +19,10 @@ impl MemoryProvider for LinuxMemory {
     fn list_modules(&self, pid: u32, flag: String) -> Result<Vec<ModuleInfo>, String> {
         Ok(list_modules(pid, flag))
     }
+
+    fn read_process_memory(&self, pid: u32, address: usize, size: usize) -> Result<Vec<u8>, String> {
+        Ok(read_process_memory_bytes(pid, address, size)?)
+    }
 }
 
 /// Reads `/proc/<pid>/maps` and returns all mapped virtual memory regions for the process.
@@ -481,6 +485,31 @@ fn check_integrity(disk: &[u8], mem: &[u8]) -> ModuleStatus {
     } else {
         ModuleStatus::Tampered
     }
+}
+
+/// Reads up to `size` bytes from target process memory at `address` via `/proc/<pid>/mem`,
+pub fn read_process_memory_bytes(pid: u32, address: usize, size: usize) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mem_path = format!("/proc/{}/mem", pid);
+    let mut mem_file = std::fs::File::open(&mem_path)
+        .map_err(|e| format!("Failed to open {mem_path}: {e}"))?;
+
+    mem_file
+        .seek(SeekFrom::Start(address as u64))
+        .map_err(|e| format!("Failed to seek to 0x{address:x} for PID {pid}: {e}"))?;
+
+    let mut buf = vec![0u8; size];
+    let bytes_read = mem_file
+        .read(&mut buf)
+        .map_err(|e| format!("Failed to read memory at 0x{address:x} for PID {pid}: {e}"))?;
+
+    if bytes_read == 0 {
+        return Err(format!("Failed to read memory at 0x{address:x} for PID {pid}"));
+    }
+
+    buf.truncate(bytes_read);
+    Ok(buf)
 }
 
 #[cfg(test)]

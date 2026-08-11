@@ -10,18 +10,17 @@ use ratatui::{DefaultTerminal, Frame};
 
 use super::commands;
 use crate::core::delta::{DiagnosticSeverity, LeakDelta};
+use crate::core::hex_dump::format_hex_dump;
+use crate::os::{MemoryProvider, provider};
 use crate::types::{HeapBlock, RegionProtect};
 use crate::ui::commands::ScanResult;
 use crate::ui::theme::{Theme, ThemeKind};
 use crate::utils::formatting::{format_bytes, format_bytes_i64};
 use crate::utils::loader::load_heap_snapshot;
 use crate::utils::process::{TreeDisplayRow, build_process_tree, flatten_tree};
-use crate::os::read_process_memory_bytes;
-use std::hash::Hash;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-
-const HEX_ROW_WIDTH: usize = 8 * 3;
+use std::collections::HashSet;
 
 const SIZE_BUCKETS: [(&str, usize, usize); 6] = [
     ("0-64B", 0, 64),
@@ -58,59 +57,8 @@ fn heap_view_label(mode: HeapViewMode) -> &'static str {
 }
 
 fn read_memory_bytes(pid: u32, address: usize, size: usize) -> Result<Vec<u8>, String> {
-    #[cfg(target_os = "windows")]
-    {
-        read_process_memory_bytes(pid, address, size)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        use std::io::{Read, Seek, SeekFrom};
-        if let Ok(mut file) = std::fs::File::open(format!("/proc/{pid}/mem")) {
-            if file.seek(SeekFrom::Start(address as u64)).is_ok() {
-                let mut buf = vec![0u8; size];
-                if let Ok(n) = file.read(&mut buf) {
-                    buf.truncate(n);
-                    if !buf.is_empty() {
-                        return Ok(buf);
-                    }
-                }
-            }
-        }
-        Err(format!("Unable to read memory at 0x{address:x} for PID {pid}"))
-    }
-}
-
-pub fn format_hex_dump(address: usize, bytes: &[u8]) -> Vec<String> {
-    let mut lines = Vec::new();
-    if bytes.is_empty() {
-        lines.push("  <no bytes read>".to_string());
-        return lines;
-    }
-    for (chunk_idx, chunk) in bytes.chunks(16).enumerate() {
-        let addr = address + chunk_idx * 16;
-        let mut hex_spans = String::with_capacity(48);
-        let mut ascii_spans = String::with_capacity(18);
-        ascii_spans.push('|');
-        for (i, &b) in chunk.iter().enumerate() {
-            if i == 8 {
-                hex_spans.push(' ');
-            }
-            hex_spans.push_str(&format!("{:02x} ", b));
-            if b.is_ascii_graphic() || b == b' ' {
-                ascii_spans.push(b as char);
-            } else {
-                ascii_spans.push('.');
-            }
-        }
-        let pad_len = HEX_ROW_WIDTH.saturating_sub(hex_spans.len());
-        for _ in 0..pad_len {
-            hex_spans.push(' ');
-        }
-        ascii_spans.push('|');
-
-        lines.push(format!("0x{:012x}:  {} {}", addr, hex_spans, ascii_spans));
-    }
-    lines
+    let mem = provider();
+    mem.read_process_memory(pid, address, size)
 }
 
 struct Settings {
@@ -2322,7 +2270,7 @@ impl App {
                     Span::raw("  "),
                 ];
                 let hint = |k: &str, desc: &str| -> Vec<Span<'static>> {
-                    vec![
+                    let vector = vec![
                         Span::styled(
                             k.to_string(),
                             Style::default()
@@ -2330,7 +2278,8 @@ impl App {
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::raw(format!(" {}  •  ", desc)),
-                    ]
+                    ];
+                    vector
                 };
                 spans.extend(hint("e", "edit"));
                 spans.extend(hint("q", "quit"));
@@ -3036,7 +2985,9 @@ fn render_histogram(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashMap;
+
+use super::*;
 
     // ── helpers ─────────────────────────────────────────────────────────────
 
@@ -3074,8 +3025,9 @@ mod tests {
                     vm_protect: RegionProtect::ReadWrite,
                 },
             ],
-            pointer_blocks: std::collections::HashSet::new(),
-            referenced_blocks: std::collections::HashSet::new(),
+            pointer_blocks: HashSet::new(),
+            referenced_blocks: HashSet::new(),
+            pointer_edges: HashMap::new(),
         });
         app
     }
@@ -3355,7 +3307,7 @@ mod tests {
     // ── tree view ────────────────────────────────────────────────────────────
 
     fn make_tree_rows() -> Vec<TreeDisplayRow> {
-        vec![
+        let vector = vec![
             TreeDisplayRow {
                 pid: 100,
                 name: "chrome.exe".into(),
@@ -3380,7 +3332,8 @@ mod tests {
                 has_children: false,
                 is_collapsed: false,
             },
-        ]
+        ];
+        vector
     }
 
     #[test]

@@ -37,6 +37,11 @@ impl MemoryProvider for WindowsMemory {
     fn list_modules(&self, pid: u32, flag: String) -> Result<Vec<ModuleInfo>, String> {
         Ok(list_modules(pid, flag))
     }
+
+    fn read_process_memory(&self, pid: u32, address: usize, size: usize) -> Result<Vec<u8>, String> {
+        Ok(read_process_memory_bytes(pid, address, size)?)
+    }
+
 }
 
 /// Walks the virtual address space of a process and returns all memory regions.
@@ -806,7 +811,8 @@ mod tests {
 
     // Helper to make a vec of given length filled with a value
     fn make_page(value: u8, len: usize) -> Vec<u8> {
-        vec![value; len]
+        let page = vec![value; len];
+        page
     }
 
     // --- Edge cases: empty inputs ---
