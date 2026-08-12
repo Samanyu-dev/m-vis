@@ -1802,8 +1802,14 @@ impl App {
                 .style(Style::default().bg(self.theme.bg).fg(self.theme.text)),
             frame.area(),
         );
+        let hexdump_active = self.heap_view_mode == HeapViewMode::HexDump;
+        let (left_pct, right_pct) = match (hexdump_active, self.swap_panels) {
+            (true, true)  => (60, 40),
+            (true, false) => (40, 60),
+            (false, _)    => (50, 50),
+        };
         let outerlayout =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            Layout::horizontal([Constraint::Percentage(left_pct), Constraint::Percentage(right_pct)])
                 .split(frame.area());
         let innerlayout =
             Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
