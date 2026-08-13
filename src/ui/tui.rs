@@ -18,9 +18,9 @@ use crate::ui::theme::{Theme, ThemeKind};
 use crate::utils::formatting::{format_bytes, format_bytes_i64};
 use crate::utils::loader::load_heap_snapshot;
 use crate::utils::process::{TreeDisplayRow, build_process_tree, flatten_tree};
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::collections::HashSet;
 
 const SIZE_BUCKETS: [(&str, usize, usize); 6] = [
     ("0-64B", 0, 64),
@@ -327,7 +327,7 @@ enum HeapViewMode {
     Chart,       // Chart
     Histogram,   // allocation size distribution
     PointerTree,
-    HexDump,     // raw memory inspector (hex + ASCII)
+    HexDump, // raw memory inspector (hex + ASCII)
 }
 
 const MAX_POINTER_TREE_DEPTH: usize = 16;
@@ -971,8 +971,11 @@ impl App {
             };
             let mut used_blocks: Vec<_> = snap.blocks.iter().filter(|b| !b.is_free).collect();
             used_blocks.sort_by(|a, b| b.size.cmp(&a.size));
-            let idx = self.alloc_table_page * self.alloc_table_page_size + self.alloc_table_selected;
-            let Some(block) = used_blocks.get(idx) else { return; };
+            let idx =
+                self.alloc_table_page * self.alloc_table_page_size + self.alloc_table_selected;
+            let Some(block) = used_blocks.get(idx) else {
+                return;
+            };
             (pid, block.address, block.size.min(512).max(64))
         };
 
@@ -982,7 +985,10 @@ impl App {
                 self.hex_dump_bytes = bytes;
                 self.hex_dump_scroll = 0;
                 self.heap_view_mode = HeapViewMode::HexDump;
-                self.push_message(format!("inspecting memory at 0x{:x} ({} bytes)", addr, size));
+                self.push_message(format!(
+                    "inspecting memory at 0x{:x} ({} bytes)",
+                    addr, size
+                ));
             }
             Err(e) => {
                 self.push_message(format!("failed to read memory: {e}"));
@@ -1336,12 +1342,17 @@ impl App {
 
                 let pid = if let Ok(p) = proc_input.parse::<u32>() {
                     Some(p)
-                } else if let Some(p) = self.current_pid.filter(|_| self.current_proc.as_deref() == Some(&proc_input)) {
+                } else if let Some(p) = self
+                    .current_pid
+                    .filter(|_| self.current_proc.as_deref() == Some(&proc_input))
+                {
                     Some(p)
                 } else {
                     self.proc_list.iter().find_map(|line| {
                         let tokens: Vec<&str> = line.split_whitespace().collect();
-                        if tokens.get(1) == Some(&proc_input.as_str()) || tokens.iter().any(|&t| t == proc_input) {
+                        if tokens.get(1) == Some(&proc_input.as_str())
+                            || tokens.iter().any(|&t| t == proc_input)
+                        {
                             tokens.first().and_then(|s| s.parse::<u32>().ok())
                         } else {
                             None
@@ -1354,7 +1365,10 @@ impl App {
                     return;
                 };
 
-                let addr = if let Some(hex) = addr_input.strip_prefix("0x").or_else(|| addr_input.strip_prefix("0X")) {
+                let addr = if let Some(hex) = addr_input
+                    .strip_prefix("0x")
+                    .or_else(|| addr_input.strip_prefix("0X"))
+                {
                     usize::from_str_radix(hex, 16)
                 } else {
                     usize::from_str_radix(&addr_input, 16).or_else(|_| addr_input.parse::<usize>())
@@ -1375,8 +1389,15 @@ impl App {
                 match read_memory_bytes(pid, addr, len) {
                     Ok(bytes) => {
                         self.push_line(Line::from(Span::styled(
-                            format!("─ Memory Dump: 0x{:x} ({} bytes) PID {} ─", addr, bytes.len(), pid),
-                            Style::default().fg(self.theme.cyan).add_modifier(Modifier::BOLD),
+                            format!(
+                                "─ Memory Dump: 0x{:x} ({} bytes) PID {} ─",
+                                addr,
+                                bytes.len(),
+                                pid
+                            ),
+                            Style::default()
+                                .fg(self.theme.cyan)
+                                .add_modifier(Modifier::BOLD),
                         )));
                         let dump_lines = format_hex_dump(addr, &bytes);
                         for l in &dump_lines {
@@ -1732,7 +1753,10 @@ impl App {
                                 _ => {}
                             },
                         },
-                        KeyCode::Esc if self.heap_view_mode == HeapViewMode::PointerTree || self.heap_view_mode == HeapViewMode::HexDump => {
+                        KeyCode::Esc
+                            if self.heap_view_mode == HeapViewMode::PointerTree
+                                || self.heap_view_mode == HeapViewMode::HexDump =>
+                        {
                             self.heap_view_mode = HeapViewMode::Allocations;
                         }
                         KeyCode::Char('a') if self.focus == Focus::ProcList => {
@@ -1804,13 +1828,15 @@ impl App {
         );
         let hexdump_active = self.heap_view_mode == HeapViewMode::HexDump;
         let (left_pct, right_pct) = match (hexdump_active, self.swap_panels) {
-            (true, true)  => (60, 40),
+            (true, true) => (60, 40),
             (true, false) => (40, 60),
-            (false, _)    => (50, 50),
+            (false, _) => (50, 50),
         };
-        let outerlayout =
-            Layout::horizontal([Constraint::Percentage(left_pct), Constraint::Percentage(right_pct)])
-                .split(frame.area());
+        let outerlayout = Layout::horizontal([
+            Constraint::Percentage(left_pct),
+            Constraint::Percentage(right_pct),
+        ])
+        .split(frame.area());
         let innerlayout =
             Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(outerlayout[1]);
@@ -2202,7 +2228,9 @@ impl App {
                             .border_style(Style::default().fg(self.theme.border))
                             .title(match self.heap_view_mode {
                                 HeapViewMode::Metrics => "Heap View [Tab for table]",
-                                HeapViewMode::Allocations => "Heap View [Tab for chart · 'd' inspect]",
+                                HeapViewMode::Allocations => {
+                                    "Heap View [Tab for chart · 'd' inspect]"
+                                }
                                 HeapViewMode::Histogram => {
                                     "Allocation Histogram [Tab: metrics · Enter: jump]"
                                 }
@@ -2210,9 +2238,7 @@ impl App {
                                 HeapViewMode::PointerTree => {
                                     "Pointer Tree [j/k nav · Enter expand/collapse · Esc back]"
                                 }
-                                HeapViewMode::HexDump => {
-                                    "Memory Inspector [j/k scroll · Esc back]"
-                                }
+                                HeapViewMode::HexDump => "Memory Inspector [j/k scroll · Esc back]",
                             })
                             .fg(self.theme.healthy),
                     )
@@ -2575,7 +2601,10 @@ fn render_hex_dump(
     };
 
     if bytes.is_empty() {
-        lines.push(Line::raw(format!("0x{:x}: <unable to read memory bytes>", addr)));
+        lines.push(Line::raw(format!(
+            "0x{:x}: <unable to read memory bytes>",
+            addr
+        )));
         return lines;
     }
 
@@ -2993,7 +3022,7 @@ fn render_histogram(
 mod tests {
     use std::collections::HashMap;
 
-use super::*;
+    use super::*;
 
     // ── helpers ─────────────────────────────────────────────────────────────
 

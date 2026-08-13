@@ -46,5 +46,6 @@ pub trait MemoryProvider {
     /// Pass `"-t"` as `flag` to restrict the output to tampered or injected modules only.
     fn list_modules(&self, pid: u32, flag: String) -> Result<Vec<ModuleInfo>, String>;
 
-    fn read_process_memory(&self, pid: u32, address: usize, size: usize) -> Result<Vec<u8>, String>;
+    fn read_process_memory(&self, pid: u32, address: usize, size: usize)
+    -> Result<Vec<u8>, String>;
 }

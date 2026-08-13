@@ -38,10 +38,14 @@ impl MemoryProvider for WindowsMemory {
         Ok(list_modules(pid, flag))
     }
 
-    fn read_process_memory(&self, pid: u32, address: usize, size: usize) -> Result<Vec<u8>, String> {
+    fn read_process_memory(
+        &self,
+        pid: u32,
+        address: usize,
+        size: usize,
+    ) -> Result<Vec<u8>, String> {
         Ok(read_process_memory_bytes(pid, address, size)?)
     }
-
 }
 
 /// Walks the virtual address space of a process and returns all memory regions.
@@ -443,7 +447,9 @@ pub fn read_process_memory_bytes(pid: u32, address: usize, size: usize) -> Resul
             buf.truncate(bytes_read);
             Ok(buf)
         } else {
-            Err(format!("Failed to read memory at 0x{address:x} for PID {pid}"))
+            Err(format!(
+                "Failed to read memory at 0x{address:x} for PID {pid}"
+            ))
         }
     }
 }
