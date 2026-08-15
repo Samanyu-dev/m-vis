@@ -248,4 +248,8 @@ impl MemoryProvider for MacMemory {
         }
         Ok(modules)
     }
+
+    fn read_process_memory(&self, pid: u32, address: usize, size: usize)-> Result<Vec<u8>, String> {
+        todo!("implement read_process_memory")
+    }
 }
