@@ -252,4 +252,12 @@ impl MemoryProvider for MacMemory {
     fn read_process_memory(&self, pid: u32, address: usize, size: usize)-> Result<Vec<u8>, String> {
         todo!("implement read_process_memory")
     }
+
+    fn walk_heap_granular(&self, pid: u32) -> Result<Vec<HeapBlock>, String>{
+        todo!("implement walk_heap_granular")
+    }
+
+    fn find_pointer_edges(&self, pid: u32, blocks: &[HeapBlock]) -> Result<HashMap<usize, Vec<PointerEdge>>, String> {
+        todo!("implement find_pointer_edges")
+    }
 }

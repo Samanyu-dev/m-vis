@@ -46,6 +46,14 @@ impl MemoryProvider for WindowsMemory {
     ) -> Result<Vec<u8>, String> {
         Ok(read_process_memory_bytes(pid, address, size)?)
     }
+
+    fn walk_heap_granular(&self, pid: u32) -> Result<Vec<HeapBlock>, String> {
+        Ok(walk_heap_granular(pid))
+    }
+
+    fn find_pointer_edges(&self, pid: u32, blocks: &[HeapBlock]) -> Result<HashMap<usize, Vec<PointerEdge>>, String> {
+        Ok(find_pointer_edges(pid, blocks))
+    }
 }
 
 /// Walks the virtual address space of a process and returns all memory regions.
@@ -533,7 +541,7 @@ pub fn find_pointer_edges(pid: u32, blocks: &[HeapBlock]) -> HashMap<usize, Vec<
 
 /// Coarse tagged/referenced sets for the Allocations table, derived from the
 /// same edge graph the Pointer Tree view uses.
-pub fn find_blocks_with_pointers(
+fn find_blocks_with_pointers(
     pid: u32,
     blocks: &[HeapBlock],
 ) -> (

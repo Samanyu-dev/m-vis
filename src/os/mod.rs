@@ -2,22 +2,10 @@
 mod windows;
 
 #[cfg(target_os = "windows")]
-pub use windows::find_blocks_with_pointers;
-
-#[cfg(target_os = "windows")]
-pub use windows::find_pointer_edges;
-
-#[cfg(target_os = "windows")]
-pub use windows::walk_heap_granular;
-
-#[cfg(target_os = "windows")]
 pub use windows::WindowsMemory as PlatformMemory;
 
 #[cfg(target_os = "linux")]
 mod linux;
-
-#[cfg(target_os = "linux")]
-pub use linux::walk_heap_granular;
 
 #[cfg(target_os = "linux")]
 pub use linux::LinuxMemory as PlatformMemory;
@@ -28,7 +16,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::MacMemory as PlatformMemory;
 
-use crate::types::{HeapBlock, ModuleInfo, Region};
+use crate::types::{HeapBlock, ModuleInfo, Region, PointerEdge};
+use std::collections::HashMap;
 
 /// Returns the platform-specific [`MemoryProvider`] instance.
 pub fn provider() -> PlatformMemory {
@@ -48,4 +37,8 @@ pub trait MemoryProvider {
 
     fn read_process_memory(&self, pid: u32, address: usize, size: usize)
     -> Result<Vec<u8>, String>;
+
+    fn walk_heap_granular(&self, pid: u32) -> Result<Vec<HeapBlock>, String>;
+
+    fn find_pointer_edges(&self, pid: u32, blocks: &[HeapBlock]) -> Result<HashMap<usize, Vec<PointerEdge>>, String>;
 }

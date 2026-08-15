@@ -365,6 +365,79 @@ pub fn list_modules(pid: u32, flag: String) -> Vec<ModuleInfo> {
     result
 }
 
+/// Scans live heap blocks for pointer-like values and resolves each against
+/// the full block list (live + free) via binary search.
+///
+/// Edges into a freed block are marked `target_is_free: true` — a live block
+/// still holding a reference to freed memory is a dangling-pointer / UAF signal.
+pub fn find_pointer_edges(pid: u32, blocks: &[HeapBlock]) -> HashMap<usize, Vec<PointerEdge>> {
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+
+    let mut edges: HashMap<usize, Vec<PointerEdge>> = HashMap::new();
+
+    let mem_file = match File::open(format!("/proc/{}/mem", pid)) {
+        Ok(f) => f,
+        Err(_) => return edges,
+    };
+
+    // (start, end, is_free) sorted by start — O(log n) containment lookup
+    // instead of a linear scan per pointer word.
+    let mut ranges: Vec<(usize, usize, bool)> = blocks
+        .iter()
+        .map(|b| (b.address, b.address + b.size, b.is_free))
+        .collect();
+    ranges.sort_by_key(|&(start, _, _)| start);
+
+    let find_containing = |value: usize| -> Option<(usize, bool)> {
+        let idx = ranges.partition_point(|&(start, _, _)| start <= value);
+        if idx == 0 {
+            return None;
+        }
+        let (start, end, is_free) = ranges[idx - 1];
+        (value >= start && value < end).then_some((start, is_free))
+    };
+
+    for block in blocks.iter().filter(|b| !b.is_free) {
+        let read_len = block.size.min(4096);
+        let mut buf = vec![0u8; read_len];
+
+        // read_at (pread) on /proc/<pid>/mem seeks-and-reads at the given
+        // virtual address in one syscall; short/failed reads (e.g. an
+        // unmapped or partially-unmapped page) are skipped like the
+        // Windows ReadProcessMemory failure path.
+        let bytes_read = match mem_file.read_at(&mut buf, block.address as u64) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        if bytes_read < 8 {
+            continue;
+        }
+
+        let mut offset = 0;
+        while offset + 8 <= bytes_read {
+            let value = usize::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+
+            if let Some((target, target_is_free)) = find_containing(value)
+                && target != block.address
+            {
+                let out = edges.entry(block.address).or_default();
+                if !out.iter().any(|e: &PointerEdge| e.target == target) {
+                    out.push(PointerEdge {
+                        target,
+                        target_is_free,
+                    });
+                }
+            }
+
+            offset += 8;
+        }
+    }
+
+    edges
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MapEntry {
     start: usize,
