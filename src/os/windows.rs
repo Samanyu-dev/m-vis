@@ -51,7 +51,11 @@ impl MemoryProvider for WindowsMemory {
         Ok(walk_heap_granular(pid))
     }
 
-    fn find_pointer_edges(&self, pid: u32, blocks: &[HeapBlock]) -> Result<HashMap<usize, Vec<PointerEdge>>, String> {
+    fn find_pointer_edges(
+        &self,
+        pid: u32,
+        blocks: &[HeapBlock],
+    ) -> Result<HashMap<usize, Vec<PointerEdge>>, String> {
         Ok(find_pointer_edges(pid, blocks))
     }
 }

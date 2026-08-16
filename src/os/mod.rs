@@ -16,7 +16,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::MacMemory as PlatformMemory;
 
-use crate::types::{HeapBlock, ModuleInfo, Region, PointerEdge};
+use crate::types::{HeapBlock, ModuleInfo, PointerEdge, Region};
 use std::collections::HashMap;
 
 /// Returns the platform-specific [`MemoryProvider`] instance.
@@ -40,5 +40,9 @@ pub trait MemoryProvider {
 
     fn walk_heap_granular(&self, pid: u32) -> Result<Vec<HeapBlock>, String>;
 
-    fn find_pointer_edges(&self, pid: u32, blocks: &[HeapBlock]) -> Result<HashMap<usize, Vec<PointerEdge>>, String>;
+    fn find_pointer_edges(
+        &self,
+        pid: u32,
+        blocks: &[HeapBlock],
+    ) -> Result<HashMap<usize, Vec<PointerEdge>>, String>;
 }
