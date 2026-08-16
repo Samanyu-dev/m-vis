@@ -234,6 +234,7 @@ mod tests {
 }
 
 fn get_heap_blocks(pid: u32, _granular: bool) -> Vec<HeapBlock> {
+    #[cfg(not(target_os = "macos"))]
     let mem = os::provider();
     if _granular {
         mem.walk_heap_granular(pid).unwrap_or_default()
