@@ -1,6 +1,7 @@
 use crate::os::MemoryProvider;
 use crate::types::{
-    HeapBlock, ModuleInfo, ModuleStatus, PointerEdge, Region, RegionKind, RegionProtect, RegionState,
+    HeapBlock, ModuleInfo, ModuleStatus, PointerEdge, Region, RegionKind, RegionProtect,
+    RegionState,
 };
 use mach2::kern_return::KERN_SUCCESS;
 use mach2::port::{mach_port_name_t, mach_port_t};

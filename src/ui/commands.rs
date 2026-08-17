@@ -239,6 +239,6 @@ fn get_heap_blocks(pid: u32, _granular: bool) -> Vec<HeapBlock> {
     if _granular {
         return mem.walk_heap_granular(pid).unwrap_or_default();
     }
-    
+
     mem.walk_heap(pid).unwrap_or_default()
 }

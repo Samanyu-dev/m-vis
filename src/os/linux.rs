@@ -1,6 +1,7 @@
 use crate::os::MemoryProvider;
 use crate::types::{
-    HeapBlock, ModuleInfo, ModuleStatus, PointerEdge, Region, RegionKind, RegionProtect, RegionState,
+    HeapBlock, ModuleInfo, ModuleStatus, PointerEdge, Region, RegionKind, RegionProtect,
+    RegionState,
 };
 use std::collections::HashMap;
 use std::fs;
