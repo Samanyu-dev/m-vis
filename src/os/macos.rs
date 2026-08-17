@@ -1,15 +1,15 @@
 use crate::os::MemoryProvider;
 use crate::types::{
-    HeapBlock, ModuleInfo, ModuleStatus, Region, RegionKind, RegionProtect, RegionState,
+    HeapBlock, ModuleInfo, ModuleStatus, PointerEdge, Region, RegionKind, RegionProtect, RegionState,
 };
 use mach2::kern_return::KERN_SUCCESS;
 use mach2::port::{mach_port_name_t, mach_port_t};
 use mach2::traps::mach_task_self;
-use mach2::vm::mach_vm_region;
+use mach2::vm::{mach_vm_deallocate, mach_vm_read, mach_vm_region};
 use mach2::vm_prot::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE};
 use mach2::vm_region::{VM_REGION_BASIC_INFO_64, vm_region_basic_info_64, vm_region_info_t};
 use mach2::vm_types::natural_t;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::path::Path;
 
@@ -255,7 +255,35 @@ impl MemoryProvider for MacMemory {
         address: usize,
         size: usize,
     ) -> Result<Vec<u8>, String> {
-        todo!("implement read_process_memory")
+        let task = self.get_task_port(pid)?;
+        let mut buffer_ptr: usize = 0;
+        let mut buffer_size: mach2::message::mach_msg_type_number_t = 0;
+
+        let kr = unsafe {
+            mach_vm_read(
+                task,
+                address as u64,
+                size as mach2::vm_types::mach_vm_size_t,
+                &mut buffer_ptr as *mut _,
+                &mut buffer_size,
+            )
+        };
+
+        if kr == KERN_SUCCESS && buffer_size as usize == size {
+            let mut buf = vec![0u8; size];
+            let data = unsafe { std::slice::from_raw_parts(buffer_ptr as *const u8, size) };
+            buf.copy_from_slice(data);
+            unsafe {
+                mach_vm_deallocate(
+                    mach_task_self(),
+                    buffer_ptr as _,
+                    buffer_size as mach2::vm_types::mach_vm_size_t,
+                );
+            }
+            Ok(buf)
+        } else {
+            Err(format!("mach_vm_read failed: {}", kr))
+        }
     }
 
     fn walk_heap_granular(&self, pid: u32) -> Result<Vec<HeapBlock>, String> {
