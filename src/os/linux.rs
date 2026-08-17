@@ -1,7 +1,8 @@
 use crate::os::MemoryProvider;
 use crate::types::{
-    HeapBlock, ModuleInfo, ModuleStatus, Region, RegionKind, RegionProtect, RegionState,
+    HeapBlock, ModuleInfo, ModuleStatus, PointerEdge, Region, RegionKind, RegionProtect, RegionState,
 };
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 
@@ -27,6 +28,18 @@ impl MemoryProvider for LinuxMemory {
         size: usize,
     ) -> Result<Vec<u8>, String> {
         Ok(read_process_memory_bytes(pid, address, size)?)
+    }
+
+    fn walk_heap_granular(&self, pid: u32) -> Result<Vec<HeapBlock>, String> {
+        Ok(walk_heap_granular(pid))
+    }
+
+    fn find_pointer_edges(
+        &self,
+        pid: u32,
+        blocks: &[HeapBlock],
+    ) -> Result<HashMap<usize, Vec<PointerEdge>>, String> {
+        Ok(find_pointer_edges(pid, blocks))
     }
 }
 
