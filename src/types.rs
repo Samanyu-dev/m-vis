@@ -82,3 +82,9 @@ pub struct ModuleInfo {
     pub path: String,
     pub status: ModuleStatus,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PointerEdge {
+    pub target: usize,
+    pub target_is_free: bool,
+}

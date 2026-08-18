@@ -10,12 +10,15 @@ use ratatui::{DefaultTerminal, Frame};
 
 use super::commands;
 use crate::core::delta::{DiagnosticSeverity, LeakDelta};
+use crate::core::hex_dump::format_hex_dump;
+use crate::os::{MemoryProvider, provider};
 use crate::types::{HeapBlock, RegionProtect};
 use crate::ui::commands::ScanResult;
 use crate::ui::theme::{Theme, ThemeKind};
 use crate::utils::formatting::{format_bytes, format_bytes_i64};
 use crate::utils::loader::load_heap_snapshot;
 use crate::utils::process::{TreeDisplayRow, build_process_tree, flatten_tree};
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -28,13 +31,15 @@ const SIZE_BUCKETS: [(&str, usize, usize); 6] = [
     (">1MB", 1024 * 1024, usize::MAX),
 ];
 
-const HEAP_VIEW_ORDER: [HeapViewMode; 4] = [
+const HEAP_VIEW_ORDER: [HeapViewMode; 6] = [
     HeapViewMode::Metrics,
     HeapViewMode::Allocations,
     HeapViewMode::Chart,
     HeapViewMode::Histogram,
+    HeapViewMode::PointerTree,
+    HeapViewMode::HexDump,
 ];
-const SETTINGS_ROW_COUNT: usize = 10;
+const SETTINGS_ROW_COUNT: usize = 12;
 
 fn heap_view_index(mode: HeapViewMode) -> usize {
     HEAP_VIEW_ORDER.iter().position(|&m| m == mode).unwrap_or(0)
@@ -46,7 +51,14 @@ fn heap_view_label(mode: HeapViewMode) -> &'static str {
         HeapViewMode::Allocations => "Allocations",
         HeapViewMode::Chart => "Chart",
         HeapViewMode::Histogram => "Histogram",
+        HeapViewMode::PointerTree => "Ptr Tree",
+        HeapViewMode::HexDump => "Hex Inspector",
     }
+}
+
+fn read_memory_bytes(pid: u32, address: usize, size: usize) -> Result<Vec<u8>, String> {
+    let mem = provider();
+    mem.read_process_memory(pid, address, size)
 }
 
 struct Settings {
@@ -55,7 +67,7 @@ struct Settings {
     badge_caution_mb_s: f64,
     badge_warning_mb_s: f64,
     badge_critical_mb_s: f64,
-    enabled_views: [bool; 4], // indexed via heap_view_index
+    enabled_views: [bool; 6], // indexed via heap_view_index
     default_view_idx: usize,
 }
 
@@ -67,7 +79,7 @@ impl Settings {
             badge_caution_mb_s: 2.0,
             badge_warning_mb_s: 20.0,
             badge_critical_mb_s: 100.0,
-            enabled_views: [true; 4],
+            enabled_views: [true; 6],
             default_view_idx: 0,
         }
     }
@@ -124,6 +136,133 @@ struct HeapSnapshot {
     blocks: Vec<HeapBlock>, // store raw blocks for the table
     pointer_blocks: std::collections::HashSet<usize>,
     pub referenced_blocks: std::collections::HashSet<usize>,
+    pub pointer_edges: std::collections::HashMap<usize, Vec<crate::types::PointerEdge>>,
+}
+
+struct PointerTreeRow {
+    address: usize,
+    size: usize,
+    depth: usize,
+    has_children: bool,
+    is_collapsed: bool,
+    is_leaf: bool,
+    is_dangling: bool,
+    is_cycle: bool,
+    is_shared: bool,
+}
+
+fn flatten_pointer_tree(
+    root: usize,
+    edges: &std::collections::HashMap<usize, Vec<crate::types::PointerEdge>>,
+    sizes: &std::collections::HashMap<usize, usize>,
+    collapsed: &std::collections::HashSet<usize>,
+    rows: &mut Vec<PointerTreeRow>,
+) {
+    const MAX_ROWS: usize = 5_000; // safety cap regardless of graph shape
+
+    fn walk(
+        addr: usize,
+        depth: usize,
+        path: &mut Vec<usize>,
+        visited: &mut std::collections::HashSet<usize>, // NEW: global, not just ancestor path
+        edges: &std::collections::HashMap<usize, Vec<crate::types::PointerEdge>>,
+        sizes: &std::collections::HashMap<usize, usize>,
+        collapsed: &std::collections::HashSet<usize>,
+        rows: &mut Vec<PointerTreeRow>,
+    ) {
+        if rows.len() >= MAX_ROWS {
+            return;
+        }
+
+        let is_cycle = path.contains(&addr);
+        // Only count this as "shared" (not a true cycle) if it's not on the
+        // current ancestor path. First visit anywhere inserts and continues;
+        // any later visit from a different branch is a dup, not a loop.
+        let is_shared = !is_cycle && !visited.insert(addr);
+
+        let size = sizes.get(&addr).copied().unwrap_or(0);
+        let children: &[crate::types::PointerEdge] = if is_cycle || is_shared {
+            &[]
+        } else {
+            edges.get(&addr).map(|v| v.as_slice()).unwrap_or(&[])
+        };
+        let has_children = !children.is_empty();
+
+        rows.push(PointerTreeRow {
+            address: addr,
+            size,
+            depth,
+            has_children,
+            is_collapsed: collapsed.contains(&addr),
+            is_leaf: !has_children,
+            is_dangling: false,
+            is_cycle,
+            is_shared,
+        });
+
+        if is_cycle || is_shared || collapsed.contains(&addr) || depth >= MAX_POINTER_TREE_DEPTH {
+            return;
+        }
+
+        path.push(addr);
+        for edge in children {
+            if rows.len() >= MAX_ROWS {
+                break;
+            }
+            if edge.target_is_free {
+                rows.push(PointerTreeRow {
+                    address: edge.target,
+                    size: sizes.get(&edge.target).copied().unwrap_or(0),
+                    depth: depth + 1,
+                    has_children: false,
+                    is_collapsed: false,
+                    is_leaf: true,
+                    is_dangling: true,
+                    is_cycle: false,
+                    is_shared: false,
+                });
+            } else {
+                walk(
+                    edge.target,
+                    depth + 1,
+                    path,
+                    visited,
+                    edges,
+                    sizes,
+                    collapsed,
+                    rows,
+                );
+            }
+        }
+        path.pop();
+    }
+
+    let mut path = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    walk(
+        root,
+        0,
+        &mut path,
+        &mut visited,
+        edges,
+        sizes,
+        collapsed,
+        rows,
+    );
+
+    if rows.len() >= MAX_ROWS {
+        rows.push(PointerTreeRow {
+            address: 0,
+            size: 0,
+            depth: 0,
+            has_children: false,
+            is_collapsed: false,
+            is_leaf: true,
+            is_dangling: false,
+            is_cycle: false,
+            is_shared: false,
+        });
+    }
 }
 
 /// App holds the state of the application
@@ -172,6 +311,14 @@ struct App {
     settings: Settings,
     settings_open: bool,
     settings_selected: usize,
+    pointer_tree_root: Option<usize>,
+    pointer_tree_rows: Vec<PointerTreeRow>,
+    pointer_tree_selected: usize,
+    pointer_tree_scroll: usize,
+    pointer_tree_collapsed: std::collections::HashSet<usize>,
+    hex_dump_address: Option<usize>,
+    hex_dump_bytes: Vec<u8>,
+    hex_dump_scroll: usize,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HeapViewMode {
@@ -179,7 +326,11 @@ enum HeapViewMode {
     Allocations, // table view
     Chart,       // Chart
     Histogram,   // allocation size distribution
+    PointerTree,
+    HexDump, // raw memory inspector (hex + ASCII)
 }
+
+const MAX_POINTER_TREE_DEPTH: usize = 16;
 enum InputMode {
     Normal,
     Editing,
@@ -263,6 +414,14 @@ impl App {
             settings,
             settings_open: false,
             settings_selected: 0,
+            pointer_tree_root: None,
+            pointer_tree_rows: vec![],
+            pointer_tree_selected: 0,
+            pointer_tree_scroll: 0,
+            pointer_tree_collapsed: std::collections::HashSet::new(),
+            hex_dump_address: None,
+            hex_dump_bytes: vec![],
+            hex_dump_scroll: 0,
         };
         app.push_message("mvis ready. type 'help' for commands.".into());
         app
@@ -697,8 +856,8 @@ impl App {
                 self.settings.badge_critical_mb_s =
                     (self.settings.badge_critical_mb_s + dir as f64).max(0.1)
             }
-            5..=8 => self.settings_toggle_view(self.settings_selected - 5),
-            9 => {
+            5..=10 => self.settings_toggle_view(self.settings_selected - 5),
+            11 => {
                 let len = HEAP_VIEW_ORDER.len();
                 let mut idx = self.settings.default_view_idx;
                 for _ in 0..len {
@@ -714,7 +873,7 @@ impl App {
     }
 
     fn settings_activate(&mut self) {
-        if (5..=8).contains(&self.settings_selected) {
+        if (5..=10).contains(&self.settings_selected) {
             self.settings_toggle_view(self.settings_selected - 5);
         } else {
             self.settings_adjust(1);
@@ -735,6 +894,133 @@ impl App {
         }
         if !self.settings.is_enabled(self.heap_view_mode) {
             self.heap_view_mode = self.settings.next_enabled_view(self.heap_view_mode);
+        }
+    }
+
+    fn enter_pointer_tree(&mut self, addr: usize) {
+        self.pointer_tree_root = Some(addr);
+        self.pointer_tree_selected = 0;
+        self.pointer_tree_scroll = 0;
+        self.pointer_tree_collapsed.clear();
+        self.heap_view_mode = HeapViewMode::PointerTree;
+        self.refresh_pointer_tree();
+    }
+
+    fn refresh_pointer_tree(&mut self) {
+        let Some(root) = self.pointer_tree_root else {
+            return;
+        };
+        let rows = {
+            let Some(snap) = self.heap_history.last() else {
+                return;
+            };
+            let sizes: std::collections::HashMap<usize, usize> =
+                snap.blocks.iter().map(|b| (b.address, b.size)).collect();
+            let mut rows = Vec::new();
+            flatten_pointer_tree(
+                root,
+                &snap.pointer_edges,
+                &sizes,
+                &self.pointer_tree_collapsed,
+                &mut rows,
+            );
+            rows
+        };
+        self.pointer_tree_rows = rows;
+        if self.pointer_tree_selected >= self.pointer_tree_rows.len() {
+            self.pointer_tree_selected = self.pointer_tree_rows.len().saturating_sub(1);
+        }
+        self.pointer_tree_scroll = self.pointer_tree_scroll.min(self.pointer_tree_selected);
+    }
+
+    fn pointer_tree_select_next(&mut self) {
+        if self.pointer_tree_selected + 1 < self.pointer_tree_rows.len() {
+            self.pointer_tree_selected += 1;
+        }
+    }
+
+    fn pointer_tree_select_prev(&mut self) {
+        self.pointer_tree_selected = self.pointer_tree_selected.saturating_sub(1);
+    }
+
+    fn pointer_tree_toggle_collapse(&mut self) {
+        let target = self
+            .pointer_tree_rows
+            .get(self.pointer_tree_selected)
+            .filter(|row| row.has_children)
+            .map(|row| row.address);
+        if let Some(addr) = target {
+            if self.pointer_tree_collapsed.contains(&addr) {
+                self.pointer_tree_collapsed.remove(&addr);
+            } else {
+                self.pointer_tree_collapsed.insert(addr);
+            }
+            self.refresh_pointer_tree();
+        }
+    }
+
+    fn inspect_selected_block(&mut self) {
+        let (pid, addr, size) = {
+            let Some(pid) = self.current_pid else {
+                self.push_message("no process selected to inspect memory".into());
+                return;
+            };
+            let Some(snap) = self.heap_history.last() else {
+                self.push_message("no heap snapshot available".into());
+                return;
+            };
+            let mut used_blocks: Vec<_> = snap.blocks.iter().filter(|b| !b.is_free).collect();
+            used_blocks.sort_by(|a, b| b.size.cmp(&a.size));
+            let idx =
+                self.alloc_table_page * self.alloc_table_page_size + self.alloc_table_selected;
+            let Some(block) = used_blocks.get(idx) else {
+                return;
+            };
+            (pid, block.address, block.size.min(512).max(64))
+        };
+
+        match read_memory_bytes(pid, addr, size) {
+            Ok(bytes) => {
+                self.hex_dump_address = Some(addr);
+                self.hex_dump_bytes = bytes;
+                self.hex_dump_scroll = 0;
+                self.heap_view_mode = HeapViewMode::HexDump;
+                self.push_message(format!(
+                    "inspecting memory at 0x{:x} ({} bytes)",
+                    addr, size
+                ));
+            }
+            Err(e) => {
+                self.push_message(format!("failed to read memory: {e}"));
+            }
+        }
+    }
+
+    /// Jumps into the pointer tree rooted at the currently selected Allocations
+    /// row, if that block has any pointer relationships.
+    fn try_enter_pointer_tree(&mut self) {
+        let addr_and_flag = {
+            let Some(snap) = self.heap_history.last() else {
+                return;
+            };
+            let mut used_blocks: Vec<_> = snap.blocks.iter().filter(|b| !b.is_free).collect();
+            used_blocks.sort_by(|a, b| b.size.cmp(&a.size)); // same order as render_alloc_table
+            let idx =
+                self.alloc_table_page * self.alloc_table_page_size + self.alloc_table_selected;
+            used_blocks.get(idx).map(|block| {
+                let addr = block.address;
+                let has_ptr_info =
+                    snap.pointer_blocks.contains(&addr) || snap.referenced_blocks.contains(&addr);
+                (addr, has_ptr_info)
+            })
+        };
+
+        match addr_and_flag {
+            Some((addr, true)) => self.enter_pointer_tree(addr),
+            Some((_, false)) => {
+                self.push_message("selected block has no pointer relationships".into())
+            }
+            None => {}
         }
     }
 
@@ -1049,12 +1335,93 @@ impl App {
                 }
                 Err(e) => self.push_message(format!("Error: {e}")),
             },
+            ["dump", _proc, _addr] | ["dump", _proc, _addr, _] => {
+                let proc_input = _proc.to_string();
+                let addr_input = _addr.to_string();
+                let len_input = parts.get(3).copied().unwrap_or("128").to_string();
+
+                let pid = if let Ok(p) = proc_input.parse::<u32>() {
+                    Some(p)
+                } else if let Some(p) = self
+                    .current_pid
+                    .filter(|_| self.current_proc.as_deref() == Some(&proc_input))
+                {
+                    Some(p)
+                } else {
+                    self.proc_list.iter().find_map(|line| {
+                        let tokens: Vec<&str> = line.split_whitespace().collect();
+                        if tokens.get(1) == Some(&proc_input.as_str())
+                            || tokens.iter().any(|&t| t == proc_input)
+                        {
+                            tokens.first().and_then(|s| s.parse::<u32>().ok())
+                        } else {
+                            None
+                        }
+                    })
+                };
+
+                let Some(pid) = pid else {
+                    self.push_message(format!("Process '{}' not found or invalid PID", proc_input));
+                    return;
+                };
+
+                let addr = if let Some(hex) = addr_input
+                    .strip_prefix("0x")
+                    .or_else(|| addr_input.strip_prefix("0X"))
+                {
+                    usize::from_str_radix(hex, 16)
+                } else {
+                    usize::from_str_radix(&addr_input, 16).or_else(|_| addr_input.parse::<usize>())
+                };
+
+                let Ok(addr) = addr else {
+                    self.push_message(format!("Invalid address format: {}", addr_input));
+                    return;
+                };
+
+                let len = len_input
+                    .strip_prefix("0x")
+                    .or_else(|| len_input.strip_prefix("0X"))
+                    .and_then(|s| usize::from_str_radix(s, 16).ok())
+                    .or_else(|| len_input.parse::<usize>().ok())
+                    .unwrap_or(128);
+
+                match read_memory_bytes(pid, addr, len) {
+                    Ok(bytes) => {
+                        self.push_line(Line::from(Span::styled(
+                            format!(
+                                "─ Memory Dump: 0x{:x} ({} bytes) PID {} ─",
+                                addr,
+                                bytes.len(),
+                                pid
+                            ),
+                            Style::default()
+                                .fg(self.theme.cyan)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                        let dump_lines = format_hex_dump(addr, &bytes);
+                        for l in &dump_lines {
+                            self.push_line(Line::raw(l.clone()));
+                        }
+                        self.push_line(Line::raw("─".repeat(50)));
+
+                        self.hex_dump_address = Some(addr);
+                        self.hex_dump_bytes = bytes;
+                        self.hex_dump_scroll = 0;
+                        self.heap_view_mode = HeapViewMode::HexDump;
+                    }
+                    Err(e) => {
+                        self.push_message(format!("Error dumping memory: {e}"));
+                    }
+                }
+            }
             ["clear"] => self.clear_output(),
             ["help"] => {
                 self.push_message("commands:".into());
                 self.push_message("  scan   <proc> -a          memory map".into());
                 self.push_message("  scan   <proc> -h          heap stats".into());
                 self.push_message("  scan   <proc> -v          loaded dlls".into());
+                self.push_message("  dump   <proc/pid> <addr> [len] dump raw memory bytes".into());
                 self.push_message("  leak   <proc> secs        detect leaks".into());
                 self.push_message("  leak-m <proc> secs samp   detect leaks-samples".into());
                 self.push_message(
@@ -1227,6 +1594,7 @@ impl App {
                             blocks: current.blocks,
                             pointer_blocks: current.pointer_blocks,
                             referenced_blocks: current.referenced_blocks,
+                            pointer_edges: current.pointer_edges,
                         });
                         if self.heap_history.len() > 4 {
                             self.heap_history.remove(0);
@@ -1261,6 +1629,7 @@ impl App {
                             blocks: result.blocks,
                             pointer_blocks: result.pointer_blocks,
                             referenced_blocks: result.referenced_blocks,
+                            pointer_edges: result.pointer_edges,
                         });
 
                         if self.heap_history.len() > 4 {
@@ -1351,6 +1720,10 @@ impl App {
                             Focus::ProcList => self.proc_list_select_next(),
                             Focus::AllocTable => match self.heap_view_mode {
                                 HeapViewMode::Histogram => self.histogram_select_next(),
+                                HeapViewMode::PointerTree => self.pointer_tree_select_next(),
+                                HeapViewMode::HexDump => {
+                                    self.hex_dump_scroll = self.hex_dump_scroll.saturating_add(1);
+                                }
                                 _ => self.select_next_row(),
                             },
                         },
@@ -1359,6 +1732,10 @@ impl App {
                             Focus::ProcList => self.proc_list_select_prev(),
                             Focus::AllocTable => match self.heap_view_mode {
                                 HeapViewMode::Histogram => self.histogram_select_prev(),
+                                HeapViewMode::PointerTree => self.pointer_tree_select_prev(),
+                                HeapViewMode::HexDump => {
+                                    self.hex_dump_scroll = self.hex_dump_scroll.saturating_sub(1);
+                                }
                                 _ => self.select_prev_row(),
                             },
                         },
@@ -1369,12 +1746,19 @@ impl App {
                                     self.dispatch(&format!("scan {} -h", name));
                                 }
                             }
-                            Focus::AllocTable => {
-                                if matches!(self.heap_view_mode, HeapViewMode::Histogram) {
-                                    self.jump_to_histogram_bucket();
-                                }
-                            }
+                            Focus::AllocTable => match self.heap_view_mode {
+                                HeapViewMode::Histogram => self.jump_to_histogram_bucket(),
+                                HeapViewMode::Allocations => self.try_enter_pointer_tree(),
+                                HeapViewMode::PointerTree => self.pointer_tree_toggle_collapse(),
+                                _ => {}
+                            },
                         },
+                        KeyCode::Esc
+                            if self.heap_view_mode == HeapViewMode::PointerTree
+                                || self.heap_view_mode == HeapViewMode::HexDump =>
+                        {
+                            self.heap_view_mode = HeapViewMode::Allocations;
+                        }
                         KeyCode::Char('a') if self.focus == Focus::ProcList => {
                             if let Some(name) = self.selected_proc_name() {
                                 self.dispatch(&format!("scan {} -a", name));
@@ -1390,11 +1774,17 @@ impl App {
                                 self.dispatch(&format!("baseline {}", name));
                             }
                         }
-                        KeyCode::Char('d') if self.focus == Focus::ProcList => {
-                            if let Some(name) = self.selected_proc_name() {
-                                self.dispatch(&format!("diff {}", name));
+                        KeyCode::Char('d') => match self.focus {
+                            Focus::ProcList => {
+                                if let Some(name) = self.selected_proc_name() {
+                                    self.dispatch(&format!("diff {}", name));
+                                }
                             }
-                        }
+                            Focus::AllocTable => {
+                                self.inspect_selected_block();
+                            }
+                            _ => {}
+                        },
                         KeyCode::Char('i') if self.focus == Focus::ProcList => {
                             if let Some(name) = self.selected_proc_name() {
                                 self.insert_at_cursor(&format!("{} ", name));
@@ -1436,9 +1826,17 @@ impl App {
                 .style(Style::default().bg(self.theme.bg).fg(self.theme.text)),
             frame.area(),
         );
-        let outerlayout =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(frame.area());
+        let hexdump_active = self.heap_view_mode == HeapViewMode::HexDump;
+        let (left_pct, right_pct) = match (hexdump_active, self.swap_panels) {
+            (true, true) => (60, 40),
+            (true, false) => (40, 60),
+            (false, _) => (50, 50),
+        };
+        let outerlayout = Layout::horizontal([
+            Constraint::Percentage(left_pct),
+            Constraint::Percentage(right_pct),
+        ])
+        .split(frame.area());
         let innerlayout =
             Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(outerlayout[1]);
@@ -1789,24 +2187,62 @@ impl App {
                             render_histogram(snap, w, self.histogram_selected, &self.theme)
                         }
                         HeapViewMode::Chart => unreachable!(),
+                        HeapViewMode::PointerTree => {
+                            let visible_rows = panel_height.saturating_sub(6);
+                            if visible_rows > 0 {
+                                if self.pointer_tree_selected < self.pointer_tree_scroll {
+                                    self.pointer_tree_scroll = self.pointer_tree_selected;
+                                } else if self.pointer_tree_selected
+                                    >= self.pointer_tree_scroll + visible_rows
+                                {
+                                    self.pointer_tree_scroll =
+                                        self.pointer_tree_selected + 1 - visible_rows;
+                                }
+                            }
+                            render_pointer_tree(
+                                self.pointer_tree_root,
+                                &self.pointer_tree_rows,
+                                self.pointer_tree_selected,
+                                &self.theme,
+                            )
+                        }
+                        HeapViewMode::HexDump => render_hex_dump(
+                            self.hex_dump_address,
+                            &self.hex_dump_bytes,
+                            self.hex_dump_scroll,
+                            &self.theme,
+                        ),
                     }
                 }
             };
 
+            let heap_scroll = match self.heap_view_mode {
+                HeapViewMode::PointerTree => self.pointer_tree_scroll as u16,
+                _ => 0,
+            };
+
             frame.render_widget(
-                Paragraph::new(heap_lines).block(
-                    Block::bordered()
-                        .border_style(Style::default().fg(self.theme.border))
-                        .title(match self.heap_view_mode {
-                            HeapViewMode::Metrics => "Heap View [Tab for table]",
-                            HeapViewMode::Allocations => "Heap View [Tab for chart]",
-                            HeapViewMode::Histogram => {
-                                "Allocation Histogram [Tab: metrics · Enter: jump]"
-                            }
-                            HeapViewMode::Chart => unreachable!(),
-                        })
-                        .fg(self.theme.healthy),
-                ),
+                Paragraph::new(heap_lines)
+                    .block(
+                        Block::bordered()
+                            .border_style(Style::default().fg(self.theme.border))
+                            .title(match self.heap_view_mode {
+                                HeapViewMode::Metrics => "Heap View [Tab for table]",
+                                HeapViewMode::Allocations => {
+                                    "Heap View [Tab for chart · 'd' inspect]"
+                                }
+                                HeapViewMode::Histogram => {
+                                    "Allocation Histogram [Tab: metrics · Enter: jump]"
+                                }
+                                HeapViewMode::Chart => unreachable!(),
+                                HeapViewMode::PointerTree => {
+                                    "Pointer Tree [j/k nav · Enter expand/collapse · Esc back]"
+                                }
+                                HeapViewMode::HexDump => "Memory Inspector [j/k scroll · Esc back]",
+                            })
+                            .fg(self.theme.healthy),
+                    )
+                    .scroll((heap_scroll, 0)),
                 heap_area,
             );
 
@@ -1866,7 +2302,7 @@ impl App {
                     Span::raw("  "),
                 ];
                 let hint = |k: &str, desc: &str| -> Vec<Span<'static>> {
-                    vec![
+                    let vector = vec![
                         Span::styled(
                             k.to_string(),
                             Style::default()
@@ -1874,7 +2310,8 @@ impl App {
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::raw(format!(" {}  •  ", desc)),
-                    ]
+                    ];
+                    vector
                 };
                 spans.extend(hint("e", "edit"));
                 spans.extend(hint("q", "quit"));
@@ -2030,6 +2467,188 @@ impl App {
             );
         }
     }
+}
+
+fn render_pointer_tree(
+    root: Option<usize>,
+    rows: &[PointerTreeRow],
+    selected: usize,
+    theme: &crate::ui::theme::Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![];
+
+    let Some(root_addr) = root else {
+        lines.push(Line::raw("No block selected."));
+        lines.push(Line::raw("In Allocations view, select a [PTR]/[REF]"));
+        lines.push(Line::raw("row and press Enter to open its tree."));
+        return lines;
+    };
+
+    if rows.is_empty() {
+        lines.push(Line::raw(format!(
+            "0x{:x} has no resolved pointers.",
+            root_addr
+        )));
+        return lines;
+    }
+
+    lines.push(Line::from(vec![
+        Span::raw("Root: "),
+        Span::styled(
+            format!("0x{:x}", root_addr),
+            Style::default()
+                .fg(theme.magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::raw("─".repeat(50)));
+
+    for (i, row) in rows.iter().enumerate() {
+        let indent = "  ".repeat(row.depth);
+        let prefix = if row.is_cycle {
+            "[~] "
+        } else if row.is_dangling {
+            "[!] "
+        } else if row.has_children {
+            if row.is_collapsed { "[+] " } else { "[-] " }
+        } else if row.depth > 0 {
+            "├─  "
+        } else {
+            "    "
+        };
+
+        let color = if row.is_dangling {
+            theme.growth_critical
+        } else if row.is_cycle {
+            theme.cyan
+        } else if row.is_shared {
+            theme.growth_warning
+        } else if row.is_leaf {
+            theme.healthy
+        } else {
+            theme.text
+        };
+
+        let style = if i == selected {
+            Style::default()
+                .bg(theme.highlight_bg)
+                .fg(theme.highlight_fg)
+        } else {
+            Style::default().fg(color)
+        };
+
+        let label = if row.is_dangling {
+            format!(
+                "{indent}{prefix}0x{:x}  [dangling → freed block]",
+                row.address
+            )
+        } else if row.is_cycle {
+            format!("{indent}{prefix}0x{:x}  [cycle]", row.address)
+        } else if row.is_shared {
+            format!("{indent}{prefix}0x{:x}  [shared — see above]", row.address)
+        } else {
+            format!(
+                "{indent}{prefix}0x{:x}  {}",
+                row.address,
+                format_bytes(row.size as u64)
+            )
+        };
+
+        lines.push(Line::from(Span::styled(label, style)));
+    }
+
+    lines.push(Line::raw("─".repeat(50)));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "j/k",
+            Style::default()
+                .fg(theme.growth_warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" navigate  "),
+        Span::styled(
+            "Enter",
+            Style::default()
+                .fg(theme.growth_warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" expand/collapse  "),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(theme.growth_warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" back"),
+    ]));
+
+    lines
+}
+
+fn render_hex_dump(
+    address: Option<usize>,
+    bytes: &[u8],
+    scroll: usize,
+    theme: &crate::ui::theme::Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![];
+
+    let Some(addr) = address else {
+        lines.push(Line::raw("No memory address selected for inspection."));
+        lines.push(Line::raw("Run: dump <proc/pid> <address> [length]"));
+        lines.push(Line::raw("Or select an allocation block and press 'd'."));
+        return lines;
+    };
+
+    if bytes.is_empty() {
+        lines.push(Line::raw(format!(
+            "0x{:x}: <unable to read memory bytes>",
+            addr
+        )));
+        return lines;
+    }
+
+    lines.push(Line::from(vec![
+        Span::raw("Address: "),
+        Span::styled(
+            format!("0x{:x}", addr),
+            Style::default().fg(theme.cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("  ({} bytes)", bytes.len())),
+    ]));
+    lines.push(Line::raw("─".repeat(60)));
+
+    let dump_lines = format_hex_dump(addr, bytes);
+    for l in dump_lines.into_iter().skip(scroll) {
+        lines.push(Line::from(Span::styled(l, Style::default().fg(theme.text))));
+    }
+
+    lines.push(Line::raw("─".repeat(60)));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "j/k",
+            Style::default()
+                .fg(theme.growth_warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" scroll  "),
+        Span::styled(
+            "d",
+            Style::default()
+                .fg(theme.growth_warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" inspect block  "),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(theme.growth_warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" back"),
+    ]));
+
+    lines
 }
 
 fn render_heap_metrics(
@@ -2401,6 +3020,8 @@ fn render_histogram(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     // ── helpers ─────────────────────────────────────────────────────────────
@@ -2439,8 +3060,9 @@ mod tests {
                     vm_protect: RegionProtect::ReadWrite,
                 },
             ],
-            pointer_blocks: std::collections::HashSet::new(),
-            referenced_blocks: std::collections::HashSet::new(),
+            pointer_blocks: HashSet::new(),
+            referenced_blocks: HashSet::new(),
+            pointer_edges: HashMap::new(),
         });
         app
     }
@@ -2720,7 +3342,7 @@ mod tests {
     // ── tree view ────────────────────────────────────────────────────────────
 
     fn make_tree_rows() -> Vec<TreeDisplayRow> {
-        vec![
+        let vector = vec![
             TreeDisplayRow {
                 pid: 100,
                 name: "chrome.exe".into(),
@@ -2745,7 +3367,8 @@ mod tests {
                 has_children: false,
                 is_collapsed: false,
             },
-        ]
+        ];
+        vector
     }
 
     #[test]

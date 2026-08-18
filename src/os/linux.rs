@@ -1,7 +1,9 @@
 use crate::os::MemoryProvider;
 use crate::types::{
-    HeapBlock, ModuleInfo, ModuleStatus, Region, RegionKind, RegionProtect, RegionState,
+    HeapBlock, ModuleInfo, ModuleStatus, PointerEdge, Region, RegionKind, RegionProtect,
+    RegionState,
 };
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 
@@ -18,6 +20,27 @@ impl MemoryProvider for LinuxMemory {
 
     fn list_modules(&self, pid: u32, flag: String) -> Result<Vec<ModuleInfo>, String> {
         Ok(list_modules(pid, flag))
+    }
+
+    fn read_process_memory(
+        &self,
+        pid: u32,
+        address: usize,
+        size: usize,
+    ) -> Result<Vec<u8>, String> {
+        Ok(read_process_memory_bytes(pid, address, size)?)
+    }
+
+    fn walk_heap_granular(&self, pid: u32) -> Result<Vec<HeapBlock>, String> {
+        Ok(walk_heap_granular(pid))
+    }
+
+    fn find_pointer_edges(
+        &self,
+        pid: u32,
+        blocks: &[HeapBlock],
+    ) -> Result<HashMap<usize, Vec<PointerEdge>>, String> {
+        Ok(find_pointer_edges(pid, blocks))
     }
 }
 
@@ -356,6 +379,79 @@ pub fn list_modules(pid: u32, flag: String) -> Vec<ModuleInfo> {
     result
 }
 
+/// Scans live heap blocks for pointer-like values and resolves each against
+/// the full block list (live + free) via binary search.
+///
+/// Edges into a freed block are marked `target_is_free: true` — a live block
+/// still holding a reference to freed memory is a dangling-pointer / UAF signal.
+pub fn find_pointer_edges(pid: u32, blocks: &[HeapBlock]) -> HashMap<usize, Vec<PointerEdge>> {
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+
+    let mut edges: HashMap<usize, Vec<PointerEdge>> = HashMap::new();
+
+    let mem_file = match File::open(format!("/proc/{}/mem", pid)) {
+        Ok(f) => f,
+        Err(_) => return edges,
+    };
+
+    // (start, end, is_free) sorted by start — O(log n) containment lookup
+    // instead of a linear scan per pointer word.
+    let mut ranges: Vec<(usize, usize, bool)> = blocks
+        .iter()
+        .map(|b| (b.address, b.address + b.size, b.is_free))
+        .collect();
+    ranges.sort_by_key(|&(start, _, _)| start);
+
+    let find_containing = |value: usize| -> Option<(usize, bool)> {
+        let idx = ranges.partition_point(|&(start, _, _)| start <= value);
+        if idx == 0 {
+            return None;
+        }
+        let (start, end, is_free) = ranges[idx - 1];
+        (value >= start && value < end).then_some((start, is_free))
+    };
+
+    for block in blocks.iter().filter(|b| !b.is_free) {
+        let read_len = block.size.min(4096);
+        let mut buf = vec![0u8; read_len];
+
+        // read_at (pread) on /proc/<pid>/mem seeks-and-reads at the given
+        // virtual address in one syscall; short/failed reads (e.g. an
+        // unmapped or partially-unmapped page) are skipped like the
+        // Windows ReadProcessMemory failure path.
+        let bytes_read = match mem_file.read_at(&mut buf, block.address as u64) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        if bytes_read < 8 {
+            continue;
+        }
+
+        let mut offset = 0;
+        while offset + 8 <= bytes_read {
+            let value = usize::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+
+            if let Some((target, target_is_free)) = find_containing(value)
+                && target != block.address
+            {
+                let out = edges.entry(block.address).or_default();
+                if !out.iter().any(|e: &PointerEdge| e.target == target) {
+                    out.push(PointerEdge {
+                        target,
+                        target_is_free,
+                    });
+                }
+            }
+
+            offset += 8;
+        }
+    }
+
+    edges
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MapEntry {
     start: usize,
@@ -481,6 +577,33 @@ fn check_integrity(disk: &[u8], mem: &[u8]) -> ModuleStatus {
     } else {
         ModuleStatus::Tampered
     }
+}
+
+/// Reads up to `size` bytes from target process memory at `address` via `/proc/<pid>/mem`,
+pub fn read_process_memory_bytes(pid: u32, address: usize, size: usize) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mem_path = format!("/proc/{}/mem", pid);
+    let mut mem_file =
+        std::fs::File::open(&mem_path).map_err(|e| format!("Failed to open {mem_path}: {e}"))?;
+
+    mem_file
+        .seek(SeekFrom::Start(address as u64))
+        .map_err(|e| format!("Failed to seek to 0x{address:x} for PID {pid}: {e}"))?;
+
+    let mut buf = vec![0u8; size];
+    let bytes_read = mem_file
+        .read(&mut buf)
+        .map_err(|e| format!("Failed to read memory at 0x{address:x} for PID {pid}: {e}"))?;
+
+    if bytes_read == 0 {
+        return Err(format!(
+            "Failed to read memory at 0x{address:x} for PID {pid}"
+        ));
+    }
+
+    buf.truncate(bytes_read);
+    Ok(buf)
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ pub struct ScanResult {
     pub frag: f64,
     pub pointer_blocks: std::collections::HashSet<usize>,
     pub referenced_blocks: std::collections::HashSet<usize>,
+    pub pointer_edges: std::collections::HashMap<usize, Vec<crate::types::PointerEdge>>,
 }
 
 use std::sync::mpsc::Sender;
@@ -91,15 +92,17 @@ pub fn scan(args: Vec<&str>) -> Result<ScanResult, String> {
     let output = args.get(4).cloned();
     let lines = scan_with_modes_tui(&mode.to_string(), pid, json, output);
     let raw = get_heap_blocks(pid, granular);
+    let mem = os::provider();
 
-    #[cfg(target_os = "windows")]
-    let (pointer_blocks, referenced_blocks) = crate::os::find_blocks_with_pointers(pid, &raw);
+    let pointer_edges = mem.find_pointer_edges(pid, &raw).unwrap_or_default();
 
-    #[cfg(not(target_os = "windows"))]
-    let (pointer_blocks, referenced_blocks) = (
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-    );
+    let pointer_blocks: std::collections::HashSet<usize> = pointer_edges.keys().copied().collect();
+    let referenced_blocks: std::collections::HashSet<usize> = pointer_edges
+        .values()
+        .flatten()
+        .filter(|e| !e.target_is_free)
+        .map(|e| e.target)
+        .collect();
 
     // get memory usage from sysinfo
     use sysinfo::System;
@@ -143,6 +146,7 @@ pub fn scan(args: Vec<&str>) -> Result<ScanResult, String> {
         frag,
         pointer_blocks,
         referenced_blocks,
+        pointer_edges,
     })
 }
 
@@ -231,26 +235,10 @@ mod tests {
 
 fn get_heap_blocks(pid: u32, _granular: bool) -> Vec<HeapBlock> {
     let mem = os::provider();
-    #[cfg(target_os = "windows")]
-    {
-        if _granular {
-            crate::os::walk_heap_granular(pid)
-        } else {
-            mem.walk_heap(pid).unwrap_or_default()
-        }
+    #[cfg(not(target_os = "macos"))]
+    if _granular {
+        return mem.walk_heap_granular(pid).unwrap_or_default();
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        if _granular {
-            crate::os::walk_heap_granular(pid)
-        } else {
-            mem.walk_heap(pid).unwrap_or_default()
-        }
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    {
-        mem.walk_heap(pid).unwrap_or_default()
-    }
+    mem.walk_heap(pid).unwrap_or_default()
 }
